@@ -10,8 +10,7 @@ CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
 
 STATE_FILE = "state.json"
 
-# چند صفحه تخفیف استیم (منبع واقعی)
-STEAM_DEALS_URL = "https://store.steampowered.com/search/?specials=1"
+STEAM_URL = "https://store.steampowered.com/search/?specials=1"
 
 
 # =========================
@@ -41,15 +40,13 @@ def get_time():
 
 
 # =========================
-# GET STEAM DEALS (REAL SCRAPING)
+# SCRAP STEAM
 # =========================
-def get_deals():
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+def get_games():
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    res = requests.get(STEAM_DEALS_URL, headers=headers, timeout=10)
-    soup = BeautifulSoup(res.text, "html.parser")
+    r = requests.get(STEAM_URL, headers=headers, timeout=15)
+    soup = BeautifulSoup(r.text, "html.parser")
 
     games = []
 
@@ -59,22 +56,23 @@ def get_deals():
             link = item["href"]
             game_id = link.split("/app/")[1].split("/")[0]
 
-            discount = item.select_one(".discount_pct")
-            price = item.select_one(".discount_final_price")
-            old_price = item.select_one(".discount_original_price")
+            discount_el = item.select_one(".discount_pct")
+            price_el = item.select_one(".discount_final_price")
+            old_price_el = item.select_one(".discount_original_price")
             img = item.select_one("img")["src"]
 
-            discount_val = int(discount.text.replace("-", "").replace("%", "")) if discount else 0
+            discount = int(discount_el.text.replace("-", "").replace("%", "")) if discount_el else 0
 
             games.append({
                 "id": game_id,
                 "name": title,
                 "link": link,
-                "discount": discount_val,
-                "price": price.text if price else "",
-                "old_price": old_price.text if old_price else "",
+                "discount": discount,
+                "price": price_el.text if price_el else "N/A",
+                "old_price": old_price_el.text if old_price_el else "N/A",
                 "image": img
             })
+
         except:
             continue
 
@@ -82,14 +80,14 @@ def get_deals():
 
 
 # =========================
-# FILTER (ONLY 90%+)
+# FILTER (90%+ ONLY)
 # =========================
 def is_valid(game):
     return game["discount"] >= 90
 
 
 # =========================
-# SEND TO TELEGRAM
+# TELEGRAM SEND
 # =========================
 def send(game, caption):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
@@ -105,7 +103,7 @@ def send(game, caption):
 
 
 # =========================
-# BUILD MESSAGE
+# MESSAGE
 # =========================
 def build(game):
     utc, iran, shamsi = get_time()
@@ -115,7 +113,7 @@ def build(game):
 
 📉 Discount: {game['discount']}%
 
-💰 Price: {game['price']}
+💰 Price: {game['old_price']} → {game['price']}
 
 📅 Iran: {shamsi.strftime('%Y/%m/%d')} | {iran.strftime('%H:%M')}
 
@@ -130,26 +128,34 @@ def build(game):
 # =========================
 def main():
     if not BOT_TOKEN or not CHANNEL:
-        print("Missing env vars")
+        print("Missing ENV variables")
         return
 
+    games = get_games()
     state = load_state()
-    games = get_deals()
 
-    for game in games:
+    print("TOTAL GAMES:", len(games))
 
-        if game["id"] in state["sent"]:
+    sent = 0
+
+    for g in games[:30]:  # محدود برای تست
+        print(g["name"], g["discount"])
+
+        if g["id"] in state["sent"]:
             continue
 
-        if not is_valid(game):
+        if not is_valid(g):
             continue
 
-        caption = build(game)
-        send(game, caption)
+        caption = build(g)
+        send(g, caption)
 
-        state["sent"].append(game["id"])
+        state["sent"].append(g["id"])
+        sent += 1
 
     save_state(state)
+
+    print("SENT:", sent)
 
 
 if __name__ == "__main__":
