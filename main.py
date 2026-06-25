@@ -1,5 +1,5 @@
 """
-FreeGamesHub — Steam Deal & Free Promotions Bot for Telegram
+FreeGamesHub — Multi-Source Steam Deal & Free Promotions Bot
 """
 
 import os
@@ -9,6 +9,7 @@ import requests
 import sqlite3
 import datetime
 from bs4 import BeautifulSoup
+import cloudscraper
 
 # ═══════════════════════════════════════════════════
 #  LOGGING
@@ -26,7 +27,10 @@ log = logging.getLogger(__name__)
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
 DB_FILE      = "games.db"
-MIN_DISCOUNT = 90          # minimum discount to send (except free promos)
+MIN_DISCOUNT = 90          # حداقل تخفیف برای ارسال (به جز ۱۰۰٪ که همیشه ارسال می‌شود)
+
+# ایجاد session برای cloudscraper (مقاوم در برابر Cloudflare)
+SCRAPER = cloudscraper.create_scraper()
 
 HEADERS = {
     "User-Agent": (
@@ -35,13 +39,14 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Referer": "https://steamdb.info/",
     "Cookie": (
         "birthtime=0; lastagecheckage=1-January-1990; "
         "wants_mature_content=1; cc=US;"
     ),
 }
 
-# Keywords to skip (DLC, OST, etc.)
 SKIP_KEYWORDS = [
     "DLC", "Soundtrack", "OST", "Season Pass",
     "Expansion", "Upgrade", "Add-on", "Artbook",
@@ -78,12 +83,15 @@ def mark_sent(game_id: str, title: str = ""):
     conn.close()
 
 # ═══════════════════════════════════════════════════
-#  HTTP HELPER
+#  HTTP HELPER (با پشتیبانی از cloudscraper)
 # ═══════════════════════════════════════════════════
-def safe_get(url, params=None, retries=3, delay=2) -> requests.Response | None:
+def safe_get(url, params=None, retries=3, delay=2, use_scraper=True) -> requests.Response | None:
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            if use_scraper:
+                r = SCRAPER.get(url, params=params, headers=HEADERS, timeout=30)
+            else:
+                r = requests.get(url, params=params, headers=HEADERS, timeout=20)
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 10))
                 log.warning(f"Rate limited — waiting {wait}s")
@@ -100,25 +108,40 @@ def safe_get(url, params=None, retries=3, delay=2) -> requests.Response | None:
     return None
 
 # ═══════════════════════════════════════════════════
-#  SOURCE 1: STEAM FEATURED + SEARCH
+#  SOURCE 1 & 2: STEAM FEATURED + SEARCH (با پشتیبانی از ۱۰۰٪)
 # ═══════════════════════════════════════════════════
 def fetch_games() -> list[dict]:
     games = []
+    
+    # منبع ۱: Featured API
     featured = _fetch_featured()
     _merge(games, featured)
     log.info(f"Source 1 (Featured): {len(featured)} games")
-
+    
+    # منبع ۲: HTML Search (specials)
     html_games = _fetch_html_search()
     before = len(games)
     _merge(games, html_games)
     log.info(f"Source 2 (HTML Search): {len(html_games)} raw → {len(games)-before} new")
-
-    # ─── SOURCE 3: STEAMDB FREE PROMOTIONS ───
-    free_games = _fetch_free_promotions()
+    
+    # منبع ۳: SteamDB Upcoming Free
+    free_db1 = _fetch_steamdb_free("upcoming")
     before = len(games)
-    _merge(games, free_games)
-    log.info(f"Source 3 (Free Promotions): {len(free_games)} raw → {len(games)-before} new")
-
+    _merge(games, free_db1)
+    log.info(f"Source 3 (SteamDB Upcoming Free): {len(free_db1)} → {len(games)-before} new")
+    
+    # منبع ۴: SteamDB Free (لیست رایگان‌های فعلی)
+    free_db2 = _fetch_steamdb_free("current")
+    before = len(games)
+    _merge(games, free_db2)
+    log.info(f"Source 4 (SteamDB Current Free): {len(free_db2)} → {len(games)-before} new")
+    
+    # منبع ۵: Steam Search با فیلتر free (بازی‌های رایگان استیم)
+    steam_free = _fetch_steam_free_search()
+    before = len(games)
+    _merge(games, steam_free)
+    log.info(f"Source 5 (Steam Free Search): {len(steam_free)} → {len(games)-before} new")
+    
     log.info(f"Total unique deals collected: {len(games)}")
     return games
 
@@ -149,11 +172,12 @@ def _make_game(appid: str, title: str, discount: int,
 def _fetch_featured() -> list[dict]:
     games = []
     r = safe_get("https://store.steampowered.com/api/featuredcategories/",
-                 params={"cc": "US", "l": "english"})
+                 params={"cc": "US", "l": "english"}, use_scraper=False)
     if not r:
         return games
     try:
         data = r.json()
+        # specials
         for item in data.get("specials", {}).get("items", []):
             name = item.get("name", "")
             if not name or _should_skip(name):
@@ -170,11 +194,11 @@ def _fetch_featured() -> list[dict]:
                 f"${final/100:.2f}" if final else "",
                 orig / 100, final / 100,
             ))
-        # also check top_sellers/new_releases for discounts
+        # top_sellers و new_releases
         for section in ["top_sellers", "new_releases"]:
             for item in data.get(section, {}).get("items", []):
                 disc = item.get("discount_percent", 0)
-                if disc < MIN_DISCOUNT:
+                if disc < MIN_DISCOUNT and disc != 100:
                     continue
                 name  = item.get("name", "")
                 appid = str(item.get("id", ""))
@@ -197,6 +221,7 @@ def _fetch_html_search() -> list[dict]:
     r = safe_get(
         "https://store.steampowered.com/search/",
         params={"specials": 1, "cc": "US", "l": "english"},
+        use_scraper=False,
     )
     if not r:
         return games
@@ -223,6 +248,8 @@ def _fetch_html_search() -> list[dict]:
                         discount = int(disc_el.text.strip().replace("-", "").replace("%", ""))
                     except ValueError:
                         pass
+                if discount < MIN_DISCOUNT and discount != 100:
+                    continue
                 orig_el  = row.select_one(".discount_original_price")
                 final_el = row.select_one(".discount_final_price")
                 games.append(_make_game(
@@ -237,71 +264,116 @@ def _fetch_html_search() -> list[dict]:
     return games
 
 # ═══════════════════════════════════════════════════
-#  SOURCE 3: STEAMDB FREE PROMOTIONS
+#  SOURCE 3 & 4: STEAMDB (upcoming & current free)
 # ═══════════════════════════════════════════════════
-def _fetch_free_promotions() -> list[dict]:
+def _fetch_steamdb_free(mode: str) -> list[dict]:
     """
-    Scrapes https://steamdb.info/upcoming/free/ to find games that are
-    temporarily free to keep. Returns list with discount=100.
+    mode: 'upcoming' -> /upcoming/free/
+          'current'  -> /free/
     """
     games = []
-    url = "https://steamdb.info/upcoming/free/"
-    r = safe_get(url, retries=3, delay=2)
+    if mode == "upcoming":
+        url = "https://steamdb.info/upcoming/free/"
+    else:
+        url = "https://steamdb.info/free/"
+    
+    r = safe_get(url, retries=3, delay=2, use_scraper=True)
     if not r:
+        log.warning(f"SteamDB {mode} free page not accessible.")
         return games
-
+    
     try:
         soup = BeautifulSoup(r.text, "html.parser")
-        # The free promotions table usually has class "table" or "table-striped"
         table = soup.select_one("table.table")
         if not table:
-            log.warning("Free promotions table not found on SteamDB page.")
+            log.warning(f"Table not found in {url}")
             return games
-
+        
         rows = table.select("tbody tr")
         for row in rows:
             try:
-                # Extract app link and title
                 link_tag = row.select_one("td a")
                 if not link_tag:
                     continue
                 href = link_tag.get("href", "")
                 if "/app/" not in href:
                     continue
-                # href like "/app/123456/"
                 appid = href.split("/app/")[1].strip("/")
                 if not appid.isdigit():
                     continue
                 title = link_tag.text.strip()
                 if _should_skip(title):
                     continue
-
-                # Check if it's a free promotion (not free-to-play)
-                # SteamDB page lists both free-to-play and timed freebies.
-                # We can check the "Price" column or "Free" badge, but we'll just add all with 100% discount.
-                # The bot will later check if it's truly free via appdetails.
                 games.append(_make_game(
-                    appid, title, 100,  # discount 100
+                    appid, title, 100,
                     orig_fmt="",
                     final_fmt="FREE",
                 ))
             except Exception as e:
-                log.debug(f"Free promo row parse error: {e}")
-
-        log.info(f"Scraped {len(games)} free promotions from SteamDB")
+                log.debug(f"SteamDB {mode} row parse error: {e}")
+        
+        log.info(f"SteamDB {mode} scraped {len(games)} games")
     except Exception as e:
-        log.error(f"Free promotions scrape error: {e}")
-
+        log.error(f"SteamDB {mode} scrape error: {e}")
+    
     return games
 
 # ═══════════════════════════════════════════════════
-#  STEAM APP DETAILS
+#  SOURCE 5: STEAM SEARCH WITH FILTER=FREE
+# ═══════════════════════════════════════════════════
+def _fetch_steam_free_search() -> list[dict]:
+    """
+    Scrape Steam search with filter=free to get all free games (including temporary).
+    """
+    games = []
+    r = safe_get(
+        "https://store.steampowered.com/search/",
+        params={"filter": "free", "category1": "998", "cc": "US", "l": "english"},
+        use_scraper=False,
+    )
+    if not r:
+        return games
+    
+    try:
+        soup = BeautifulSoup(r.text, "html.parser")
+        for row in soup.select(".search_result_row"):
+            try:
+                href = row.get("href", "")
+                if "/app/" not in href:
+                    continue
+                appid = href.split("/app/")[1].split("/")[0]
+                if not appid.isdigit():
+                    continue
+                title_el = row.select_one(".title")
+                if not title_el:
+                    continue
+                title = title_el.text.strip()
+                if _should_skip(title):
+                    continue
+                # این صفحه معمولاً تخفیف‌ها را نشان نمی‌دهد، اما همه رایگان هستند
+                # ما با discount=100 اضافه می‌کنیم
+                games.append(_make_game(
+                    appid, title, 100,
+                    orig_fmt="",
+                    final_fmt="FREE",
+                ))
+            except Exception as e:
+                log.debug(f"Steam free search row parse error: {e}")
+        log.info(f"Steam free search scraped {len(games)} games")
+    except Exception as e:
+        log.error(f"Steam free search error: {e}")
+    
+    return games
+
+# ═══════════════════════════════════════════════════
+#  STEAM APP DETAILS, REVIEWS, VALIDATION, CAPTION, SENDER (بدون تغییر)
 # ═══════════════════════════════════════════════════
 def get_details(appid: str) -> dict | None:
-    time.sleep(1.5)   # rate limiting
+    time.sleep(1.5)
     r = safe_get(
         f"https://store.steampowered.com/api/appdetails",
         params={"appids": appid, "cc": "us", "l": "english"},
+        use_scraper=False,
     )
     if not r:
         return None
@@ -315,13 +387,11 @@ def get_details(appid: str) -> dict | None:
         log.error(f"AppDetails parse error ({appid}): {e}")
         return None
 
-# ═══════════════════════════════════════════════════
-#  STEAM REVIEWS
-# ═══════════════════════════════════════════════════
 def get_steam_reviews(appid: str) -> tuple[int | None, int | None, str]:
     r = safe_get(
         f"https://store.steampowered.com/appreviews/{appid}",
         params={"json": 1, "language": "all", "purchase_type": "all", "num_per_page": 0},
+        use_scraper=False,
     )
     if not r:
         return None, None, ""
@@ -338,11 +408,8 @@ def get_steam_reviews(appid: str) -> tuple[int | None, int | None, str]:
         log.debug(f"Reviews error ({appid}): {e}")
         return None, None, ""
 
-# ═══════════════════════════════════════════════════
-#  VALIDATION
-# ═══════════════════════════════════════════════════
 def is_valid(game: dict, details: dict | None) -> bool:
-    # free promotion (discount 100) or is_free
+    # همیشه ۱۰۰٪ را قبول کن
     if game["discount"] == 100:
         return True
     if details and details.get("is_free"):
@@ -351,27 +418,20 @@ def is_valid(game: dict, details: dict | None) -> bool:
         return True
     return False
 
-# ═══════════════════════════════════════════════════
-#  CAPTION BUILDER (English only, clean layout)
-# ═══════════════════════════════════════════════════
 def build_caption(game: dict, details: dict | None,
                   rev_pct: int | None, rev_count: int | None,
                   rev_desc: str) -> str:
-
     details = details or {}
-    # ── Genres ─────────────────────────────────────
     raw_genres = details.get("genres", [])
     genre_list = [g["description"] for g in raw_genres] if raw_genres else []
     genre_str  = ", ".join(genre_list) if genre_list else "Unknown"
 
-    # ── Description ────────────────────────────────
     raw_desc = details.get("short_description", "No description available.")
     raw_desc = BeautifulSoup(raw_desc, "html.parser").get_text()
     desc = raw_desc[:280].rstrip()
     if len(raw_desc) > 280:
         desc += "…"
 
-    # ── Reviews ─────────────────────────────────────
     if rev_pct is not None and rev_count:
         if rev_pct >= 80:
             mood = "🟢"
@@ -383,13 +443,10 @@ def build_caption(game: dict, details: dict | None,
     else:
         review_line = "—"
 
-    # ── Metacritic ──────────────────────────────────
     meta       = details.get("metacritic", {}) or {}
     meta_score = meta.get("score")
 
-    # ── Price & Discount ────────────────────────────
     is_free = details.get("is_free", False)
-    # Use price_overview if available
     po = details.get("price_overview") or {}
     if po:
         game["price_original_fmt"] = po.get("initial_formatted", game.get("price_original_fmt", ""))
@@ -410,7 +467,6 @@ def build_caption(game: dict, details: dict | None,
                        if orig and final else (final or orig or "?"))
         disc_block  = f"<b>-{game['discount']}%</b> 🔥"
 
-    # ── Hashtags ────────────────────────────────────
     tags = ["#FreeGamesHub", "#SteamDeals"]
     for g in genre_list[:2]:
         tag = g.replace(" ", "").replace("-", "").replace("&", "and")
@@ -421,7 +477,6 @@ def build_caption(game: dict, details: dict | None,
         tags.append("#MegaDeal")
     hashtags = " ".join(tags)
 
-    # ── Build caption (English only, clean) ──────
     lines = [
         f"🎮 <b>{game['title']}</b>",
         "",
@@ -447,20 +502,14 @@ def build_caption(game: dict, details: dict | None,
 
     caption = "\n".join(lines)
 
-    # ── Telegram limit 1024 chars ──────────────────
     if len(caption) > 1024:
-        # shorten description
         short_desc = raw_desc[:100].rstrip() + "…"
-        # replace the description line
-        # find the index of desc in lines and replace
         for i, line in enumerate(lines):
             if line == desc:
                 lines[i] = short_desc
                 break
         caption = "\n".join(lines)
-        # if still too long, remove description block
         if len(caption) > 1024:
-            # remove the description lines (indices 4,5,6)
             new_lines = []
             skip = False
             for line in lines:
@@ -476,9 +525,6 @@ def build_caption(game: dict, details: dict | None,
 
     return caption
 
-# ═══════════════════════════════════════════════════
-#  TELEGRAM SENDER
-# ═══════════════════════════════════════════════════
 def send_game(game: dict, caption: str) -> bool:
     appid = game["id"]
     image_candidates = [
@@ -525,7 +571,7 @@ def send_game(game: dict, caption: str) -> bool:
 # ═══════════════════════════════════════════════════
 def main():
     log.info("═" * 55)
-    log.info("  🎮 FreeGamesHub — Steam Deals + Free Promos")
+    log.info("  🎮 FreeGamesHub — Multi-Source Free & Deal Bot")
     log.info("═" * 55)
 
     if not BOT_TOKEN or not CHANNEL:
@@ -539,7 +585,7 @@ def main():
         log.error("No games found!")
         return
 
-    # Sort: free promos first, then highest discount
+    # مرتب‌سازی: اول ۱۰۰٪، سپس بیشترین تخفیف
     games.sort(key=lambda x: (x["discount"] == 100, x["discount"]), reverse=True)
 
     sent_ok  = 0
@@ -589,7 +635,7 @@ def main():
             failed += 1
             log.error(f"       ❌ Send failed")
 
-        time.sleep(3)   # rate limit
+        time.sleep(3)
 
     log.info("═" * 55)
     log.info(f"  ✅ Sent:          {sent_ok}")
