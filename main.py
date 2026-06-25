@@ -1,5 +1,5 @@
 """
-FreeGamesHub — Steam Deals + Free Promotions with Dates
+FreeGamesHub — Steam Deals + Free Promotions with Deduplication by Promo Period
 """
 
 import os
@@ -30,6 +30,7 @@ CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
 DB_FILE      = "games.db"
 MIN_DISCOUNT = 90          # حداقل تخفیف برای ارسال (به جز ۱۰۰٪ که همیشه بررسی می‌شود)
 
+# Cloudscraper session برای دور زدن Cloudflare
 SCRAPER = cloudscraper.create_scraper()
 
 HEADERS = {
@@ -47,35 +48,38 @@ SKIP_KEYWORDS = [
 ]
 
 # ═══════════════════════════════════════════════════
-#  DATABASE
+#  DATABASE (با کلید ترکیبی game_id + promo_end)
 # ═══════════════════════════════════════════════════
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sent (
-            id       TEXT PRIMARY KEY,
-            title    TEXT,
-            sent_at  TEXT
+            game_id    TEXT,
+            promo_end  TEXT,   -- تاریخ پایان تخفیف (یا "Unknown" با fallback)
+            title      TEXT,
+            sent_at    TEXT,
+            PRIMARY KEY (game_id, promo_end)
         )
     """)
     conn.commit()
     conn.close()
 
-def is_sent(game_id: str) -> bool:
+def is_sent(game_id: str, promo_key: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
-    row = conn.execute("SELECT 1 FROM sent WHERE id=?", (game_id,)).fetchone()
+    row = conn.execute("SELECT 1 FROM sent WHERE game_id=? AND promo_end=?", (game_id, promo_key)).fetchone()
     conn.close()
     return row is not None
 
-def mark_sent(game_id: str, title: str = ""):
+def mark_sent(game_id: str, title: str = "", promo_key: str = ""):
     ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(DB_FILE)
-    conn.execute("INSERT OR IGNORE INTO sent VALUES (?,?,?)", (game_id, title, ts))
+    conn.execute("INSERT OR IGNORE INTO sent (game_id, promo_end, title, sent_at) VALUES (?,?,?,?)",
+                 (game_id, promo_key, title, ts))
     conn.commit()
     conn.close()
 
 # ═══════════════════════════════════════════════════
-#  HTTP HELPER
+#  HTTP HELPER (با پشتیبانی از cloudscraper)
 # ═══════════════════════════════════════════════════
 def safe_get(url, params=None, retries=3, delay=2, use_scraper=True):
     for attempt in range(retries):
@@ -98,7 +102,7 @@ def safe_get(url, params=None, retries=3, delay=2, use_scraper=True):
     return None
 
 # ═══════════════════════════════════════════════════
-#  SOURCES (بدون Steam Free Search)
+#  SOURCE FUNCTIONS (Featured, HTML Search, SteamDB)
 # ═══════════════════════════════════════════════════
 def fetch_games() -> list[dict]:
     games = []
@@ -114,7 +118,7 @@ def fetch_games() -> list[dict]:
     _merge(games, html_games)
     log.info(f"Source 2 (HTML Search): {len(html_games)} raw → {len(games)-before} new")
 
-    # منبع ۳: SteamDB Upcoming Free (اگر دسترسی داشت)
+    # منبع ۳: SteamDB Upcoming Free
     free_db1 = _fetch_steamdb_free("upcoming")
     before = len(games)
     _merge(games, free_db1)
@@ -280,11 +284,10 @@ def _fetch_steamdb_free(mode: str) -> list[dict]:
     return games
 
 # ═══════════════════════════════════════════════════
-#  GET DISCOUNT DATES (با اسکرپ صفحه بازی)
+#  GET DISCOUNT DATES (استخراج تاریخ پایان تخفیف)
 # ═══════════════════════════════════════════════════
 def get_discount_dates(appid: str) -> tuple[str, str]:
     """
-    استخراج تاریخ شروع و پایان تخفیف از صفحهٔ استیم.
     برمی‌گرداند: (start_date, end_date) به فرمت UTC یا "Unknown"
     """
     url = f"https://store.steampowered.com/app/{appid}/"
@@ -294,26 +297,21 @@ def get_discount_dates(appid: str) -> tuple[str, str]:
 
     try:
         soup = BeautifulSoup(r.text, "html.parser")
-        # معمولاً تاریخ تخفیف در المان‌های class="game_purchase_discount_quantity" یا مشابه
-        # یا در بخش "Special Promotion" با کلاس "discount_block"
         discount_block = soup.select_one(".discount_block")
         if discount_block:
             text = discount_block.get_text(separator=" ", strip=True)
-            # جستجوی الگوی تاریخ مثل "Offer ends 25 Jun, 2026" یا "Ends in ..."
+            # جستجوی عبارت "Offer ends ..."
             match = re.search(r"Offer ends\s+([\w]+\s+\d{1,2},\s+\d{4})", text, re.IGNORECASE)
             if match:
                 end_str = match.group(1)
-                # تبدیل به فرمت استاندارد (تلاش برای parse)
                 try:
                     end_dt = datetime.datetime.strptime(end_str, "%b %d, %Y")
                     end_utc = end_dt.strftime("%Y-%m-%d %H:%M UTC")
                 except:
                     end_utc = end_str
-                # تاریخ شروع معمولاً درج نمی‌شود، از امروز استفاده می‌کنیم
                 start_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
                 return start_utc, end_utc
-        # اگر پیدا نشد، از المنت‌های دیگر استفاده کنیم
-        # گاهی در "game_purchase_price" یا "discount_pct" اطلاعاتی هست
+        # اگر پیدا نشد، از زمان فعلی به‌عنوان شروع و "Unknown" برای پایان
         return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), "Unknown"
     except Exception as e:
         log.debug(f"Date extraction failed for {appid}: {e}")
@@ -364,16 +362,13 @@ def get_steam_reviews(appid: str):
         return None, None, ""
 
 # ═══════════════════════════════════════════════════
-#  VALIDATION (رد بازی‌های Free to Play)
+#  VALIDATION (رد بازی‌های Free-to-Play)
 # ═══════════════════════════════════════════════════
 def is_valid(game: dict, details: dict | None) -> bool:
-    # اگر بازی رایگان دائمی باشد، رد کن
     if details and details.get("is_free", False):
         return False
-    # تخفیف ۱۰۰٪ (موقت رایگان) – قبول
     if game["discount"] == 100:
         return True
-    # تخفیف >= MIN_DISCOUNT
     if game["discount"] >= MIN_DISCOUNT:
         return True
     return False
@@ -393,7 +388,6 @@ def build_caption(game: dict, details: dict | None,
     raw_desc = BeautifulSoup(raw_desc, "html.parser").get_text()
     desc = raw_desc[:280].rstrip() + ("…" if len(raw_desc) > 280 else "")
 
-    # Reviews
     if rev_pct is not None and rev_count:
         mood = "🟢" if rev_pct >= 80 else ("🟡" if rev_pct >= 60 else "🔴")
         review_line = f"{mood} <b>{rev_pct}%</b> from {rev_count:,} reviews — {rev_desc}"
@@ -403,7 +397,6 @@ def build_caption(game: dict, details: dict | None,
     meta = details.get("metacritic", {}) or {}
     meta_score = meta.get("score")
 
-    # Price
     po = details.get("price_overview") or {}
     if po:
         game["price_original_fmt"] = po.get("initial_formatted", game.get("price_original_fmt", ""))
@@ -420,7 +413,6 @@ def build_caption(game: dict, details: dict | None,
         price_block = (f"<s>{orig}</s> → <b>{final}</b>" if orig and final else (final or orig or "?"))
         disc_block  = f"<b>-{game['discount']}%</b> 🔥"
 
-    # Hashtags
     tags = ["#FreeGamesHub", "#SteamDeals"]
     for g in genre_list[:2]:
         tag = re.sub(r'[^a-zA-Z0-9]', '', g)
@@ -431,7 +423,6 @@ def build_caption(game: dict, details: dict | None,
         tags.append("#MegaDeal")
     hashtags = " ".join(tags)
 
-    # ساخت کپشن با تاریخ
     lines = [
         f"🎮 <b>{game['title']}</b>",
         "",
@@ -523,7 +514,7 @@ def send_game(game: dict, caption: str) -> bool:
 # ═══════════════════════════════════════════════════
 def main():
     log.info("═" * 55)
-    log.info("  🎮 FreeGamesHub — Deals + Free Promos with Dates")
+    log.info("  🎮 FreeGamesHub — Deals + Free Promos with Dates & Dedup")
     log.info("═" * 55)
 
     if not BOT_TOKEN or not CHANNEL:
@@ -536,7 +527,7 @@ def main():
         log.error("No games found!")
         return
 
-    # اولویت با ۱۰۰٪ و سپس بیشترین تخفیف
+    # مرتب‌سازی: اول ۱۰۰٪، سپس بیشترین تخفیف
     games.sort(key=lambda x: (x["discount"] == 100, x["discount"]), reverse=True)
 
     sent_ok = skipped = no_valid = failed = 0
@@ -548,48 +539,59 @@ def main():
 
         log.info(f"[{idx:3}/{len(games)}] {title[:50]:<50} | -{disc}%")
 
-        if is_sent(gid):
+        # ۱. دریافت تاریخ تخفیف (قبل از هر چیز)
+        start_date, end_date = get_discount_dates(gid)
+        if end_date == "Unknown":
+            promo_key = start_date if start_date != "Unknown" else "permanent"
+        else:
+            promo_key = end_date
+
+        # ۲. چک تکراری بودن بر اساس دوره تخفیف
+        if is_sent(gid, promo_key):
+            log.info("       ↪ Already sent for this promotion period")
             skipped += 1
             continue
 
+        # ۳. دریافت جزئیات بازی
         details = get_details(gid)
         if not details:
             failed += 1
             continue
 
-        # رد بازی‌های رایگان دائمی
+        # ۴. رد بازی‌های رایگان دائمی
         if details.get("is_free", False):
-            log.info(f"       ↪ Free-to-play — skipped")
+            log.info("       ↪ Free-to-play — skipped")
             no_valid += 1
             continue
 
+        # ۵. رد انواع غیر بازی
         app_type = details.get("type", "")
         if app_type not in ("game", ""):
             log.info(f"       ↪ Type {app_type!r} — skipped")
             no_valid += 1
             continue
 
+        # ۶. اعتبارسنجی تخفیف
         if not is_valid(game, details):
             log.info(f"       ↪ Insufficient discount ({disc}%) — skipped")
             no_valid += 1
             continue
 
-        # دریافت تاریخ تخفیف
-        start_date, end_date = get_discount_dates(gid)
-
+        # ۷. دریافت نقدها و ساخت کپشن
         rev_pct, rev_count, rev_desc = get_steam_reviews(gid)
         caption = build_caption(game, details, rev_pct, rev_count, rev_desc, start_date, end_date)
 
+        # ۸. ارسال به تلگرام
         ok = send_game(game, caption)
         if ok:
-            mark_sent(gid, title)
+            mark_sent(gid, title, promo_key)
             sent_ok += 1
             log.info(f"       ✅ Sent")
         else:
             failed += 1
             log.error(f"       ❌ Send failed")
 
-        time.sleep(3)
+        time.sleep(3)   # فاصله بین ارسال‌ها
 
     log.info("═" * 55)
     log.info(f"  ✅ Sent:          {sent_ok}")
