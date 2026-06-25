@@ -1,0 +1,1 @@
+print("FreeGamesHub Bot Started")
