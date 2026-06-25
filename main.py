@@ -1,24 +1,29 @@
+import os
 import requests
 import json
 import datetime
 import jdatetime
 
-# === CONFIG ===
-BOT_TOKEN = "YOUR_TOKEN"
-CHANNEL = "@FreeGamesHubAlert"
-
-STEAM_URL = "https://store.steampowered.com/api/featuredcategories/?cc=us&l=en"
+# ======================
+# CONFIG (از GitHub Secrets)
+# ======================
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHANNEL = os.environ.get("TELEGRAM_CHANNEL")
 
 STATE_FILE = "state.json"
 
+STEAM_URL = "https://store.steampowered.com/api/featuredcategories/?cc=us&l=en"
 
-# === LOAD STATE ===
+
+# ======================
+# STATE (جلوگیری از ارسال تکراری)
+# ======================
 def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except:
-        return {"sent": []}
+        return {"sent_games": []}
 
 
 def save_state(state):
@@ -26,89 +31,119 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-# === DATE CONVERTER ===
-def convert_time():
-    now = datetime.datetime.utcnow()
-    iran_time = now + datetime.timedelta(hours=3, minutes=30)
+# ======================
+# TIME CONVERT (UTC + IRAN + SHAMSI)
+# ======================
+def get_times():
+    utc_now = datetime.datetime.utcnow()
+    iran_time = utc_now + datetime.timedelta(hours=3, minutes=30)
     shamsi = jdatetime.datetime.fromgregorian(datetime=iran_time)
+    return utc_now, iran_time, shamsi
 
-    return iran_time, shamsi
 
-
-# === SEND TO TELEGRAM ===
-def send_to_telegram(title, image, caption):
+# ======================
+# TELEGRAM SEND
+# ======================
+def send_photo(title, image, caption):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    payload = {
+
+    data = {
         "chat_id": CHANNEL,
         "photo": image,
         "caption": caption,
         "parse_mode": "HTML"
     }
-    requests.post(url, data=payload)
+
+    requests.post(url, data=data)
 
 
-# === GET STEAM DATA ===
+# ======================
+# STEAM FETCH
+# ======================
 def get_games():
-    data = requests.get(STEAM_URL).json()
+    try:
+        res = requests.get(STEAM_URL, timeout=10)
+        data = res.json()
+        return data.get("specials", {}).get("items", [])
+    except:
+        return []
 
-    specials = data.get("specials", {}).get("items", [])
-    free = data.get("specials", {}).get("items", [])
 
-    return specials
-
-
-# === FILTER GAME ===
+# ======================
+# FILTER (فقط 90%+ یا رایگان)
+# ======================
 def is_valid(game):
     discount = game.get("discount_percent", 0)
-    price = game.get("final_price", 999)
+    final_price = game.get("final_price", 999999)
 
-    # فقط 90%+ یا رایگان
-    if discount >= 90 or price == 0:
+    if discount >= 90 or final_price == 0:
         return True
 
     return False
 
 
-# === BUILD CAPTION ===
+# ======================
+# BUILD CAPTION (فارسی + انگلیسی + تاریخ)
+# ======================
 def build_caption(game):
-    iran_time, shamsi = convert_time()
+    utc_now, iran_time, shamsi = get_times()
 
-    title = game.get("name")
+    title = game.get("name", "Unknown Game")
     desc = game.get("short_description", "No description available")
+
+    price_old = game.get("original_price", 0) / 100
+    price_new = game.get("final_price", 0) / 100
+    discount = game.get("discount_percent", 0)
+
+    steam_link = f"https://store.steampowered.com/app/{game.get('id')}"
 
     caption = f"""
 🎮 <b>{title}</b>
 
-🇮🇷 توضیحات:
+🎯 Genre | ژانر
+🇬🇧 Action / Adventure / RPG
+🇮🇷 اکشن / ماجراجویی / نقش‌آفرینی
+
+📝 Description | توضیحات
+
+🇮🇷
 {desc[:250]}
 
-🇬🇧 Description:
+🇬🇧
 {desc[:250]}
 
-💰 Price: {game.get('original_price', 0)/100}$ → {game.get('final_price', 0)/100}$
+💰 Price | قیمت
+{price_old}$ → {price_new}$
 
-📉 Discount: {game.get('discount_percent', 0)}%
+📉 Discount | تخفیف
+{discount}%
 
-📅 Iran Time:
-{shamsi.strftime('%Y/%m/%d')} | {iran_time.strftime('%H:%M')}
+📅 Start Time | شروع
+🇮🇷 {shamsi.strftime('%Y/%m/%d')} | {iran_time.strftime('%H:%M')} (IR)
+🇬🇧 {utc_now.strftime('%Y-%m-%d %H:%M')} UTC
 
-🌍 UTC:
-{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M')}
-
-🔗 https://store.steampowered.com/app/{game.get('id')}
+🔗 Steam Link
+{steam_link}
 """
+
     return caption
 
 
-# === MAIN ===
+# ======================
+# MAIN
+# ======================
 def main():
+    if not BOT_TOKEN or not CHANNEL:
+        print("Missing Secrets!")
+        return
+
     state = load_state()
     games = get_games()
 
     for game in games:
         game_id = game.get("id")
 
-        if game_id in state["sent"]:
+        if game_id in state["sent_games"]:
             continue
 
         if not is_valid(game):
@@ -116,13 +151,13 @@ def main():
 
         caption = build_caption(game)
 
-        send_to_telegram(
+        send_photo(
             game.get("name"),
             game.get("header_image"),
             caption
         )
 
-        state["sent"].append(game_id)
+        state["sent_games"].append(game_id)
 
     save_state(state)
 
