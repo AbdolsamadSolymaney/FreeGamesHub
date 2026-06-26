@@ -1,13 +1,12 @@
 """
-FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
+FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-نسخه نهایی با AI Decision Engine و تمام اصلاحات
-- AI با GitHub Models (آدرس api.github.com)
-- پرامپت دقیق و کامل برای AI
-- نمایش تاریخ شمسی و میلادی با پشتیبانی از فرمت‌های مختلف
-- Smart Selector برای مقاومت در برابر تغییرات ساختار
-- افزایش Retry برای پایداری بیشتر
-- اجرای خودکار هر ۱۲ ساعت
+نسخه نهایی با اصلاحات:
+- AI با endpoint صحیح GitHub Models
+- GOG با اسکرپینگ + API
+- PlayStation با Smart Selector + fallback
+- تاریخ شمسی با پشتیبانی از فرمت‌های مختلف
+- افزایش پایداری و retry
 """
 
 import os
@@ -24,7 +23,7 @@ from bs4 import BeautifulSoup
 import cloudscraper
 import feedparser
 
-# تلاش برای import jdatetime (برای تاریخ شمسی)
+# تلاش برای import jdatetime
 try:
     import jdatetime
     JDT_AVAILABLE = True
@@ -32,9 +31,7 @@ except ImportError:
     JDT_AVAILABLE = False
     jdatetime = None
 
-# ═══════════════════════════════════════════════════
-#  LOGGING
-# ═══════════════════════════════════════════════════
+# ─── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -42,9 +39,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════════
+# ─── Config ──────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
 RAWG_API_KEY = os.environ.get("RAWG_API_KEY", "")
@@ -52,7 +47,6 @@ DB_FILE      = "games.db"
 SELECTORS_DB = "selectors_cache.json"
 MIN_DISCOUNT = 75
 
-# آستانه تشخیص AAA با Metacritic
 AAA_METACRITIC_THRESHOLD = 75
 AAA_RATING_THRESHOLD = 80
 AAA_REVIEWS_THRESHOLD = 2000
@@ -84,9 +78,7 @@ STORE_META = {
     "xbox_gamepass":        {"emoji": "🟩", "name": "Xbox Game Pass",      "tag": "#XboxGamePass"},
 }
 
-# ═══════════════════════════════════════════════════
-#  CACHE ۲۴ ساعته
-# ═══════════════════════════════════════════════════
+# ─── Cache ۲۴ ساعته ────────────────────────────────────────────────────
 SENT_CACHE = {}
 
 def is_recently_sent_cached(store: str, game_id: str, hours: int = 24) -> bool:
@@ -100,9 +92,7 @@ def is_recently_sent_cached(store: str, game_id: str, hours: int = 24) -> bool:
 def mark_sent_cached(store: str, game_id: str):
     SENT_CACHE[(store, game_id)] = datetime.datetime.utcnow()
 
-# ═══════════════════════════════════════════════════
-#  DATABASE
-# ═══════════════════════════════════════════════════
+# ─── Database ────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""
@@ -203,9 +193,7 @@ def is_recently_sent_db(store: str, game_id: str, days: int = 365) -> bool:
     except:
         return False
 
-# ═══════════════════════════════════════════════════
-#  HTTP HELPER (با افزایش Retry به ۵)
-# ═══════════════════════════════════════════════════
+# ─── HTTP Helper (با افزایش Retry) ────────────────────────────────────
 def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_headers=None):
     headers = dict(HEADERS)
     if extra_headers:
@@ -229,50 +217,34 @@ def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_head
     log.error(f"All {retries} attempts failed for {url}")
     return None
 
-# ═══════════════════════════════════════════════════
-#  AI DECISION ENGINE
-# ═══════════════════════════════════════════════════
-
+# ─── AI Decision Engine (با endpoint صحیح) ────────────────────────────
 class AIDecisionEngine:
-    """
-    موتور تصمیم‌گیری هوش مصنوعی
-    - بررسی کامل بازی با AI (آدرس api.github.com)
-    - Consensus با ۳ بار درخواست برای دقت ۱۰۰٪
-    - پرامپت دقیق و کامل
-    """
-    
     def __init__(self):
         self.token = os.environ.get("GITHUB_TOKEN", "")
         self.enabled = bool(self.token)
         self.consensus_count = 3
         self.confidence_threshold = 80
-        self.decisions_log = []
-        
         if self.enabled:
             log.info("🤖 AI Decision Engine initialized with GitHub Models")
         else:
             log.warning("⚠️ GITHUB_TOKEN not set — using fallback logic")
-    
+
     def decide(self, game: Dict[str, Any]) -> Tuple[bool, str, Dict]:
         if not self.enabled:
             return self._fallback_decision(game)
-        
-        quick_check = self._quick_check(game)
-        if not quick_check[0]:
-            return False, quick_check[1], {}
-        
+        quick = self._quick_check(game)
+        if not quick[0]:
+            return False, quick[1], {}
         results = []
-        for i in range(self.consensus_count):
-            result = self._call_ai(game)
-            if result:
-                results.append(result)
+        for _ in range(self.consensus_count):
+            res = self._call_ai(game)
+            if res:
+                results.append(res)
             time.sleep(0.5)
-        
         if not results:
             return self._fallback_decision(game)
-        
         return self._analyze_consensus(results, game)
-    
+
     def _quick_check(self, game: dict) -> Tuple[bool, str]:
         title = game.get('title', '')
         for kw in SKIP_KEYWORDS:
@@ -282,7 +254,7 @@ class AIDecisionEngine:
             orig = game.get('price_orig_fmt', '')
             final = game.get('price_final_fmt', '')
             if orig and final and orig == final and game.get('discount', 0) > 0:
-                return False, "Price mismatch: original = final but discount > 0"
+                return False, "Price mismatch"
         start = game.get('deal_start', '')
         end = game.get('deal_end', '')
         if start and end:
@@ -290,24 +262,26 @@ class AIDecisionEngine:
                 s = datetime.datetime.strptime(start, "%Y-%m-%d")
                 e = datetime.datetime.strptime(end, "%Y-%m-%d")
                 if s > e:
-                    return False, "Start date after end date"
+                    return False, "Start after end"
             except:
                 pass
         return True, "Quick check passed"
-    
+
     def _call_ai(self, game: dict) -> Optional[dict]:
         prompt = self._build_prompt(game)
         try:
+            # استفاده از endpoint صحیح GitHub Models (بدون /v1)
             response = requests.post(
-                "https://api.github.com/v1/chat/completions",  # آدرس اصلاح شده
+                "https://models.github.com/chat/completions",
                 headers={
                     "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
                 },
                 json={
                     "model": "gpt-4o",
                     "messages": [
-                        {"role": "system", "content": "You are a precise game deal validator. Always respond in JSON. You must decide if this deal is valid and should be sent to users."},
+                        {"role": "system", "content": "You are a precise game deal validator. Always respond in JSON."},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.0,
@@ -320,121 +294,71 @@ class AIDecisionEngine:
                 return None
             data = response.json()
             content = data['choices'][0]['message']['content']
-            import re
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
-            else:
-                return None
+            return None
         except Exception as e:
             log.error(f"AI call error: {e}")
             return None
-    
+
     def _build_prompt(self, game: dict) -> str:
         return f"""
-You are an expert game deal validator AI. Your ONLY job is to analyze game deal data and decide if it's VALID and should be sent to users. You must NEVER guess or assume - base your decision ONLY on the provided data.
+You are an expert game deal validator AI. Your ONLY job is to analyze game deal data and decide if it's VALID and should be sent to users.
 
-=== YOUR ROLE ===
-You are a quality control system for a Telegram game deals bot. Your decision determines whether users see this deal or not. Accuracy is critical.
-
-=== DATA TO ANALYZE ===
-Game Title: {game.get('title', 'Unknown')}
+=== DATA ===
+Title: {game.get('title', 'Unknown')}
 Store: {game.get('store', 'Unknown')}
 Discount: {game.get('discount', 0)}%
 Original Price: {game.get('price_orig_fmt', 'N/A')}
 Final Price: {game.get('price_final_fmt', 'N/A')}
 Link: {game.get('link', 'N/A')}
-Is Free to Keep: {game.get('is_free_to_keep', False)}
-Deal Start: {game.get('deal_start', 'N/A')}
-Deal End: {game.get('deal_end', 'N/A')}
+Free to Keep: {game.get('is_free_to_keep', False)}
+Start: {game.get('deal_start', 'N/A')}
+End: {game.get('deal_end', 'N/A')}
 Genres: {game.get('genres', [])}
-Metacritic Score: {game.get('metacritic', 'N/A')}
+Metacritic: {game.get('metacritic', 'N/A')}
 
-=== VALIDATION RULES (REJECT IF ANY APPLY) ===
-1. REJECT if title contains: DLC, Soundtrack, OST, Season Pass, Expansion, Upgrade, Add-on, Artbook, Comic, Deluxe, Bundle, Content Pack, Cosmetic, Starter Pack (these are not full games)
-2. REJECT if discount is 100% but it's NOT marked as "Free to Keep" (likely a free weekend or temporary)
-3. REJECT if discount percentage is inconsistent with prices (e.g., original $60, final $60, but discount says 50%)
-4. REJECT if start date is after end date (invalid timeframe)
-5. REJECT if link is broken or doesn't contain the store domain (steam, epic, gog, playstation, xbox)
-6. REJECT if title is truncated, corrupted, or contains special characters excessively (like @#$%^&*)
-7. REJECT if the game appears to be a demo, beta, or prologue (title contains: demo, beta, prologue, trial)
+=== RULES (REJECT IF ANY) ===
+- Title contains DLC, Soundtrack, OST, Season Pass, Upgrade, Add-on, Deluxe, Bundle, Cosmetic
+- Discount 100% but NOT Free to Keep
+- Inconsistent prices (original=final but discount>0)
+- Start > End
+- Link invalid
+- Title corrupted (special chars)
 
-=== ACCEPTANCE RULES (ACCEPT IF ALL PASS) ===
-1. Game is a full title (not DLC, not add-on)
-2. Discount is valid and matches prices
-3. Dates are logical (start < end)
-4. Link is valid
-5. Title is clean and readable
+=== SPECIAL ===
+- 100% + Free to Keep → ACCEPT
+- Metacritic ≥ 90 → prioritize ACCEPT
 
-=== SPECIAL CASES ===
-- If discount is 100% AND Free to Keep is TRUE → ACCEPT (it's a permanent free game)
-- If discount is 100% but Free to Keep is FALSE → REJECT (it's a free weekend/temporary)
-- If Metacritic score is 90+ → prioritize ACCEPT (it's a critically acclaimed game)
-- If game is AAA (by your judgment) and discount > 50% → prioritize ACCEPT
-
-=== RESPONSE FORMAT ===
-You MUST respond in JSON format ONLY. No extra text.
-
+=== RESPOND JSON ===
 {{
   "decision": "accept" or "reject",
   "confidence": 0-100,
-  "reason": "Brief explanation of your decision",
-  "warnings": ["list", "of", "any", "issues", "found"],
-  "corrected_data": {{
-    "field_name": "corrected_value"
-  }}
+  "reason": "short explanation",
+  "warnings": [],
+  "corrected_data": {{}}
 }}
-
-If no corrections needed, "corrected_data" should be empty {{}}.
-Confidence should be 80+ if you're certain, 50-79 if uncertain, below 50 if very uncertain.
-
-=== NOW DECIDE ===
-Analyze the game data above and respond with your decision. Be thorough and accurate.
 """
-    
-    def _analyze_consensus(self, results: list, original_game: dict) -> Tuple[bool, str, dict]:
+
+    def _analyze_consensus(self, results: list, game: dict) -> Tuple[bool, str, dict]:
         if len(results) < 2:
-            return self._extract_result(results[0], original_game) if results else (False, "No AI response", {})
-        accept_count = 0
-        reject_count = 0
-        all_warnings = []
-        all_corrections = {}
-        confidence_sum = 0
-        for r in results:
-            decision = r.get("decision", "reject")
-            if decision == "accept":
-                accept_count += 1
-            else:
-                reject_count += 1
-            confidence_sum += r.get("confidence", 0)
-            all_warnings.extend(r.get("warnings", []))
-            corrections = r.get("corrected_data", {})
-            for key, value in corrections.items():
-                if key not in all_corrections:
-                    all_corrections[key] = value
-        avg_confidence = confidence_sum / len(results) if results else 0
-        unique_warnings = list(set(all_warnings))
-        if accept_count > reject_count and avg_confidence >= self.confidence_threshold:
-            return True, f"Accepted: {accept_count}/{len(results)} consensus", all_corrections
-        elif accept_count > reject_count and avg_confidence < self.confidence_threshold:
-            return False, f"Low confidence ({avg_confidence:.0f}%)", all_corrections
-        elif reject_count >= accept_count:
-            return False, f"Rejected by AI: {', '.join(unique_warnings[:2])}", all_corrections
+            return self._extract_result(results[0], game) if results else (False, "No AI response", {})
+        accept = sum(1 for r in results if r.get("decision") == "accept")
+        reject = len(results) - accept
+        conf = sum(r.get("confidence", 0) for r in results) / len(results)
+        if accept > reject and conf >= self.confidence_threshold:
+            return True, f"Accepted ({accept}/{len(results)})", {}
+        elif accept > reject and conf < self.confidence_threshold:
+            return False, f"Low confidence ({conf:.0f}%)", {}
         else:
-            return False, "No clear consensus", all_corrections
-    
+            return False, "Rejected by AI", {}
+
     def _extract_result(self, result: dict, game: dict) -> Tuple[bool, str, dict]:
-        decision = result.get("decision", "reject")
-        confidence = result.get("confidence", 0)
-        reason = result.get("reason", "No reason provided")
-        warnings = result.get("warnings", [])
-        corrections = result.get("corrected_data", {})
-        if decision == "accept" and confidence >= self.confidence_threshold:
-            return True, f"Accepted: {reason}", corrections
-        else:
-            warning_text = ", ".join(warnings[:2]) if warnings else reason
-            return False, f"Rejected: {warning_text}", corrections
-    
+        if result.get("decision") == "accept" and result.get("confidence", 0) >= self.confidence_threshold:
+            return True, "Accepted", {}
+        return False, "Rejected", {}
+
     def _fallback_decision(self, game: dict) -> Tuple[bool, str, dict]:
         title = game.get('title', '').lower()
         for kw in ["dlc", "soundtrack", "season pass", "deluxe", "bundle"]:
@@ -443,7 +367,7 @@ Analyze the game data above and respond with your decision. Be thorough and accu
         if game.get('discount', 0) > 95 and not game.get('is_free_to_keep'):
             return False, "High discount but not Free to Keep (fallback)", {}
         return True, "Passed fallback validation", {}
-    
+
     def log_decision(self, game: dict, decision: str, reason: str):
         conn = sqlite3.connect(DB_FILE)
         conn.execute("""
@@ -461,26 +385,12 @@ Analyze the game data above and respond with your decision. Be thorough and accu
         conn.commit()
         conn.close()
 
-# ═══════════════════════════════════════════════════
-#  DATE FORMATTER (با پشتیبانی از فرمت‌های مختلف)
-# ═══════════════════════════════════════════════════
+# ─── Date Formatter (با پشتیبانی از فرمت‌های مختلف) ──────────────────
 def format_date_persian_english(date_str: str) -> str:
     if not date_str:
         return "نامشخص"
-    
-    # حذف زمان و منطقه زمانی
     date_str_clean = date_str.split("T")[0].split(" ")[0]
-    
-    # فرمت‌های مختلف تاریخ را امتحان کن
-    formats = [
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-        "%d %b %Y",
-        "%b %d, %Y",
-        "%d/%m/%Y",
-        "%m/%d/%Y"
-    ]
-    
+    formats = ["%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%b %d, %Y", "%d/%m/%Y", "%m/%d/%Y"]
     dt = None
     for fmt in formats:
         try:
@@ -488,117 +398,84 @@ def format_date_persian_english(date_str: str) -> str:
             break
         except ValueError:
             continue
-    
     if dt is None:
         return date_str
-    
     gregorian = dt.strftime("%d %b %Y")
-    
     if JDT_AVAILABLE and jdatetime:
         try:
             jd = jdatetime.datetime.fromgregorian(datetime=dt)
             persian = jd.strftime("%Y/%m/%d")
             return f"{persian}\n{gregorian}"
-        except Exception as e:
-            log.debug(f"jdatetime conversion error: {e}")
+        except:
             return gregorian
-    else:
-        return gregorian
+    return gregorian
 
-# ═══════════════════════════════════════════════════
-#  RAWG API
-# ═══════════════════════════════════════════════════
+# ─── RAWG API ────────────────────────────────────────────────────────────
 _rawg_cache: dict = {}
 
 def rawg_search(title: str) -> dict | None:
     if not RAWG_API_KEY:
         return None
-    
     cache_key = title.lower().strip()
     if cache_key in _rawg_cache:
         return _rawg_cache[cache_key]
-
     clean = re.sub(r"[™®©]", "", title).strip()
     clean = re.sub(r"\s*[\(\[\{].*?[\)\]\}]", "", clean).strip()
-
     params = {"search": clean, "page_size": 5, "key": RAWG_API_KEY}
-
-    r = safe_get(
-        "https://api.rawg.io/api/games",
-        params=params,
-        extra_headers={"Referer": "https://rawg.io/"},
-        retries=3,
-        delay=1
-    )
+    r = safe_get("https://api.rawg.io/api/games", params=params, extra_headers={"Referer": "https://rawg.io/"}, retries=3)
     if not r:
         _rawg_cache[cache_key] = None
         return None
-
     try:
-        results = r.json().get("results", [])
+        data = r.json()
+        results = data.get("results", [])
         if not results:
             _rawg_cache[cache_key] = None
             return None
-
-        best       = None
+        best = None
         best_score = 0
-        title_low  = clean.lower()
         for item in results:
             name = item.get("name", "").lower()
-            if name == title_low:
+            if name == clean.lower():
                 score = 100
-            elif title_low in name or name in title_low:
+            elif clean.lower() in name or name in clean.lower():
                 score = 80
             else:
-                t_words = set(title_low.split())
+                t_words = set(clean.lower().split())
                 i_words = set(name.split())
-                score   = len(t_words & i_words) / max(len(t_words), 1) * 60
+                score = len(t_words & i_words) / max(len(t_words), 1) * 60
             if score > best_score:
                 best_score = score
                 best = item
-
         if best_score < 40 or not best:
             _rawg_cache[cache_key] = None
             return None
-
+        detail = safe_get(f"https://api.rawg.io/api/games/{best['id']}", params={"key": RAWG_API_KEY}, retries=3)
         description = ""
-        detail_params = {"key": RAWG_API_KEY}
-        dr = safe_get(
-            f"https://api.rawg.io/api/games/{best['id']}",
-            params=detail_params,
-            extra_headers={"Referer": "https://rawg.io/"},
-            retries=3,
-            delay=1
-        )
-        if dr:
-            raw_desc = dr.json().get("description", "") or dr.json().get("description_raw", "")
+        if detail:
+            raw_desc = detail.json().get("description", "") or detail.json().get("description_raw", "")
             if raw_desc:
                 description = BeautifulSoup(raw_desc, "html.parser").get_text().strip()
                 description = re.sub(r'\n{3,}', '\n\n', description)
-
-        genres       = [g["name"] for g in best.get("genres", [])]
-        rawg_rating  = best.get("rating", 0)
-        rating_count = best.get("ratings_count", 0)
-        rating_pct   = round(rawg_rating / 5 * 100) if rawg_rating else None
-        metacritic   = best.get("metacritic")
-        bg_image     = best.get("background_image", "") or ""
-        released     = best.get("released", "")
-
+        genres = [g["name"] for g in best.get("genres", [])]
+        rating_pct = round(best.get("rating", 0) / 5 * 100) if best.get("rating") else None
+        metacritic = best.get("metacritic")
+        bg_image = best.get("background_image", "") or ""
+        released = best.get("released", "")
         result = {
-            "genres":           genres,
-            "description":      description,
-            "rating_pct":       rating_pct,
-            "ratings_count":    rating_count,
-            "metacritic":       metacritic,
-            "rawg_rating":      rawg_rating,
+            "genres": genres,
+            "description": description,
+            "rating_pct": rating_pct,
+            "ratings_count": best.get("ratings_count", 0),
+            "metacritic": metacritic,
+            "rawg_rating": best.get("rating", 0),
             "background_image": bg_image,
-            "released":         released,
+            "released": released,
         }
         _rawg_cache[cache_key] = result
         return result
-
     except Exception as e:
-        log.error(f"RAWG error for '{title}': {e}")
+        log.error(f"RAWG error: {e}")
         _rawg_cache[cache_key] = None
         return None
 
@@ -611,9 +488,9 @@ def enrich_epic_gog(game: dict):
     if not game.get("description") and rawg.get("description"):
         game["description"] = rawg["description"]
     if rawg.get("rating_pct") and rawg.get("ratings_count", 0) > 50:
-        game["review_pct"]   = rawg["rating_pct"]
+        game["review_pct"] = rawg["rating_pct"]
         game["review_count"] = rawg["ratings_count"]
-        game["review_desc"]  = f"RAWG {rawg['rawg_rating']:.1f}/5"
+        game["review_desc"] = f"RAWG {rawg['rawg_rating']:.1f}/5"
     if rawg.get("metacritic"):
         game["metacritic"] = rawg["metacritic"]
     if rawg.get("background_image"):
@@ -621,9 +498,7 @@ def enrich_epic_gog(game: dict):
     if rawg.get("released"):
         game["release_date"] = rawg["released"]
 
-# ═══════════════════════════════════════════════════
-#  GAME OBJECT FACTORY
-# ═══════════════════════════════════════════════════
+# ─── Game Factory ──────────────────────────────────────────────────────
 def _should_skip(title: str) -> bool:
     return any(kw.lower() in title.lower() for kw in SKIP_KEYWORDS)
 
@@ -634,100 +509,67 @@ def make_game(store: str, game_id: str, title: str, discount: int,
               review_pct: int = None, review_count: int = None,
               review_desc: str = "") -> dict:
     return {
-        "store":            store,
-        "id":               str(game_id),
-        "title":            title,
-        "link":             link,
-        "discount":         discount,
-        "price_orig_fmt":   orig_fmt,
-        "price_final_fmt":  final_fmt,
-        "image_url":        image_url,
-        "is_free_to_keep":  is_free_to_keep,
-        "description":      description,
-        "genres":           genres or [],
-        "review_pct":       review_pct,
-        "review_count":     review_count,
-        "review_desc":      review_desc,
-        "metacritic":       None,
-        "rawg_image":       "",
-        "steam_image":      "",
-        "deal_start":       "",
-        "deal_end":         "",
-        "release_date":     "",
-        "is_free_to_play":  False,
-        "deal_type":        "discount",
-        "priority_score":   0,
-        "is_aaa":           False,
+        "store": store, "id": str(game_id), "title": title, "discount": discount,
+        "link": link, "price_orig_fmt": orig_fmt, "price_final_fmt": final_fmt,
+        "image_url": image_url, "is_free_to_keep": is_free_to_keep,
+        "description": description, "genres": genres or [],
+        "review_pct": review_pct, "review_count": review_count, "review_desc": review_desc,
+        "metacritic": None, "rawg_image": "", "steam_image": "",
+        "deal_start": "", "deal_end": "", "release_date": "",
+        "is_free_to_play": False, "deal_type": "discount",
+        "priority_score": 0, "is_aaa": False,
     }
 
 def _merge(base: list, new_items: list):
     seen = {(g["store"], g["id"]) for g in base}
     for g in new_items:
-        key = (g["store"], g["id"])
-        if key not in seen:
+        if (g["store"], g["id"]) not in seen:
             base.append(g)
-            seen.add(key)
+            seen.add((g["store"], g["id"]))
 
-# ═══════════════════════════════════════════════════
-#  IMAGE URL
-# ═══════════════════════════════════════════════════
+# ─── Image URL ──────────────────────────────────────────────────────────
 def get_image_candidates(game: dict) -> list[str]:
-    store = game["store"]
-    gid   = game["id"]
     candidates = []
-
     if game.get("steam_image"):
         candidates.append(game["steam_image"])
-    
-    if store == "steam":
-        candidates.extend([
-            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{gid}/capsule_616x353.jpg",
-            f"https://cdn.akamai.steamstatic.com/steam/apps/{gid}/header.jpg",
-        ])
-    
+    if game.get("store") == "steam":
+        candidates.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{game['id']}/capsule_616x353.jpg")
+        candidates.append(f"https://cdn.akamai.steamstatic.com/steam/apps/{game['id']}/header.jpg")
     if game.get("rawg_image"):
         candidates.append(game["rawg_image"])
-    
     if game.get("image_url"):
         img = game["image_url"]
         img = img.replace("_small", "_large").replace("_thumb", "_original")
         img = re.sub(r'/\d+x\d+/', '/original/', img)
         candidates.append(img)
         candidates.append(game["image_url"])
-    
     return candidates
 
-# ═══════════════════════════════════════════════════
-#  PRIORITY SCORE CALCULATION
-# ═══════════════════════════════════════════════════
+# ─── Priority Score ────────────────────────────────────────────────────
 def calculate_priority_score(game: dict) -> int:
     score = 0
-    
     if game.get("review_pct"):
         score += min(int(game["review_pct"] / 4), 25)
     elif game.get("rawg_rating"):
         score += min(int(game.get("rawg_rating", 0) * 5), 25)
-    
     if game.get("metacritic"):
-        metacritic = game.get("metacritic", 0)
-        if metacritic >= 90:
+        mc = game.get("metacritic", 0)
+        if mc >= 90:
             score += 15
-        elif metacritic >= 80:
+        elif mc >= 80:
             score += 10
-        elif metacritic >= 70:
+        elif mc >= 70:
             score += 5
-    
     if game.get("review_count"):
-        count = game.get("review_count", 0)
-        if count > 100000:
+        cnt = game.get("review_count", 0)
+        if cnt > 100000:
             score += 15
-        elif count > 50000:
+        elif cnt > 50000:
             score += 10
-        elif count > 10000:
+        elif cnt > 10000:
             score += 5
-        elif count > 1000:
+        elif cnt > 1000:
             score += 3
-    
     discount = game.get("discount", 0)
     if discount == 100:
         score += 10
@@ -737,54 +579,39 @@ def calculate_priority_score(game: dict) -> int:
         score += 5
     elif discount >= 75:
         score += 3
-    
-    if game.get("is_aaa", False):
+    if game.get("is_aaa"):
         score += 15
-    
     if game.get("release_date"):
         try:
-            release = datetime.datetime.fromisoformat(game["release_date"].replace("Z", "+00:00")).replace(tzinfo=None)
-            now = datetime.datetime.utcnow()
-            days_old = (now - release).days
-            if days_old < 30:
+            rel = datetime.datetime.fromisoformat(game["release_date"].replace("Z", "+00:00")).replace(tzinfo=None)
+            days = (datetime.datetime.utcnow() - rel).days
+            if days < 30:
                 score += 10
-            elif days_old < 90:
+            elif days < 90:
                 score += 5
-            elif days_old < 365:
+            elif days < 365:
                 score += 2
         except:
             pass
-    
-    if game.get("is_free_to_keep", False):
+    if game.get("is_free_to_keep"):
         score += 20
-    
-    if game.get("is_free_to_play", False):
+    if game.get("is_free_to_play"):
         score = -999
-    
     game["priority_score"] = score
     return score
 
-# ═══════════════════════════════════════════════════
-#  DEAL TYPE DETECTION
-# ═══════════════════════════════════════════════════
+# ─── Deal Type ──────────────────────────────────────────────────────────
 def detect_deal_type(game: dict) -> str:
-    if game.get("is_free_to_play", False):
+    if game.get("is_free_to_play"):
         return "free_to_play"
-    if game.get("is_free_to_keep", False):
+    if game.get("is_free_to_keep"):
         return "free_to_keep"
-    if game.get("discount") == 100 and not game.get("is_free_to_keep"):
+    if game.get("discount") == 100:
         return "free_weekend"
     return "discount"
 
 def get_deal_emoji(deal_type: str) -> str:
-    if deal_type == "free_to_keep":
-        return "🟢"
-    elif deal_type == "free_weekend":
-        return "🟡"
-    elif deal_type == "free_to_play":
-        return "🔵"
-    else:
-        return "🟣"
+    return {"free_to_keep": "🟢", "free_weekend": "🟡", "free_to_play": "🔵"}.get(deal_type, "🟣")
 
 def get_deal_label(deal_type: str, discount: int) -> str:
     if deal_type == "free_to_keep":
@@ -796,15 +623,10 @@ def get_deal_label(deal_type: str, discount: int) -> str:
     else:
         return f"{discount}% تخفیف"
 
-# ═══════════════════════════════════════════════════
-#  STEAM SOURCES
-# ═══════════════════════════════════════════════════
+# ─── Steam Sources ─────────────────────────────────────────────────────
 def _steam_fetch_featured() -> list[dict]:
     games = []
-    r = safe_get(
-        "https://store.steampowered.com/api/featuredcategories/",
-        params={"cc": "US", "l": "english"},
-    )
+    r = safe_get("https://store.steampowered.com/api/featuredcategories/", params={"cc": "US", "l": "english"})
     if not r:
         return games
     try:
@@ -813,47 +635,40 @@ def _steam_fetch_featured() -> list[dict]:
             name = item.get("name", "")
             if not name:
                 continue
-            appid    = str(item.get("id", ""))
+            appid = str(item.get("id", ""))
             discount = item.get("discount_percent", 0)
-            orig     = item.get("original_price", 0)
-            final    = item.get("final_price", 0)
+            orig = item.get("original_price", 0)
+            final = item.get("final_price", 0)
             if not appid:
                 continue
-            games.append(make_game(
-                "steam", appid, name, discount,
+            games.append(make_game("steam", appid, name, discount,
                 f"https://store.steampowered.com/app/{appid}/",
                 f"${orig/100:.2f}" if orig else "",
                 f"${final/100:.2f}" if final else "",
-                f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
-            ))
+                f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"))
         for section in ["top_sellers", "new_releases"]:
             for item in data.get(section, {}).get("items", []):
                 disc = item.get("discount_percent", 0)
                 if disc < MIN_DISCOUNT and disc != 100:
                     continue
-                name  = item.get("name", "")
+                name = item.get("name", "")
                 appid = str(item.get("id", ""))
                 if not appid or not name:
                     continue
-                orig  = item.get("original_price", 0)
+                orig = item.get("original_price", 0)
                 final = item.get("final_price", 0)
-                games.append(make_game(
-                    "steam", appid, name, disc,
+                games.append(make_game("steam", appid, name, disc,
                     f"https://store.steampowered.com/app/{appid}/",
                     f"${orig/100:.2f}" if orig else "",
                     f"${final/100:.2f}" if final else "",
-                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
-                ))
+                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"))
     except Exception as e:
-        log.error(f"Steam Featured parse error: {e}")
+        log.error(f"Steam Featured error: {e}")
     return games
 
 def _steam_fetch_html_search() -> list[dict]:
     games = []
-    r = safe_get(
-        "https://store.steampowered.com/search/",
-        params={"specials": 1, "cc": "US", "l": "english"},
-    )
+    r = safe_get("https://store.steampowered.com/search/", params={"specials": 1, "cc": "US", "l": "english"})
     if not r:
         return games
     try:
@@ -870,7 +685,7 @@ def _steam_fetch_html_search() -> list[dict]:
                 if not title_el:
                     continue
                 title = title_el.text.strip()
-                disc_el  = row.select_one(".discount_pct")
+                disc_el = row.select_one(".discount_pct")
                 discount = 0
                 if disc_el:
                     try:
@@ -879,33 +694,28 @@ def _steam_fetch_html_search() -> list[dict]:
                         pass
                 if discount < MIN_DISCOUNT and discount != 100:
                     continue
-                orig_el  = row.select_one(".discount_original_price")
+                orig_el = row.select_one(".discount_original_price")
                 final_el = row.select_one(".discount_final_price")
-                games.append(make_game(
-                    "steam", appid, title, discount,
+                games.append(make_game("steam", appid, title, discount,
                     f"https://store.steampowered.com/app/{appid}/",
                     orig_el.text.strip() if orig_el else "",
                     final_el.text.strip() if final_el else "",
-                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
-                ))
-            except Exception as e:
+                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"))
+            except:
                 pass
     except Exception as e:
-        log.error(f"Steam HTML search parse error: {e}")
+        log.error(f"Steam HTML search error: {e}")
     return games
 
 def _steam_fetch_free_to_keep() -> list[dict]:
     games = []
-    r = safe_get(
-        "https://store.steampowered.com/search/results/",
-        params={"specials": 1, "maxprice": "free", "cc": "US",
-                "l": "english", "json": 1, "count": 50},
-    )
+    r = safe_get("https://store.steampowered.com/search/results/",
+                 params={"specials": 1, "maxprice": "free", "cc": "US", "l": "english", "json": 1, "count": 50})
     if r:
         try:
             data = r.json()
             for item in data.get("items", []):
-                logo  = item.get("logo", "")
+                logo = item.get("logo", "")
                 match = re.search(r"/apps/(\d+)/", logo)
                 if not match:
                     continue
@@ -916,22 +726,16 @@ def _steam_fetch_free_to_keep() -> list[dict]:
                 price_str = str(item.get("price", "")).lower()
                 if "free" not in price_str and price_str != "0":
                     continue
-                games.append(make_game(
-                    "steam", appid, title, 100,
+                games.append(make_game("steam", appid, title, 100,
                     f"https://store.steampowered.com/app/{appid}/",
                     final_fmt="FREE",
                     image_url=f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
-                    is_free_to_keep=True,
-                ))
+                    is_free_to_keep=True))
                 log.info(f"  🎁 Steam FTK (JSON): {title}")
-        except Exception as e:
-            log.error(f"Steam FTK JSON error: {e}")
-
+        except:
+            pass
     if not games:
-        r2 = safe_get(
-            "https://store.steampowered.com/search/",
-            params={"specials": 1, "maxprice": "free", "cc": "US", "l": "english"},
-        )
+        r2 = safe_get("https://store.steampowered.com/search/", params={"specials": 1, "maxprice": "free", "cc": "US", "l": "english"})
         if r2:
             try:
                 soup = BeautifulSoup(r2.text, "html.parser")
@@ -949,50 +753,41 @@ def _steam_fetch_free_to_keep() -> list[dict]:
                     disc_el = row.select_one(".discount_pct")
                     if not disc_el or "-100%" not in disc_el.text:
                         continue
-                    games.append(make_game(
-                        "steam", appid, title, 100,
+                    games.append(make_game("steam", appid, title, 100,
                         f"https://store.steampowered.com/app/{appid}/",
                         final_fmt="FREE",
                         image_url=f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
-                        is_free_to_keep=True,
-                    ))
+                        is_free_to_keep=True))
                     log.info(f"  🎁 Steam FTK (HTML): {title}")
-            except Exception as e:
-                log.error(f"Steam FTK HTML error: {e}")
-
+            except:
+                pass
     log.info(f"Steam Free to Keep: {len(games)}")
     return games
 
 def steam_get_details(appid: str) -> dict | None:
     time.sleep(1.2)
-    r = safe_get(
-        "https://store.steampowered.com/api/appdetails",
-        params={"appids": appid, "cc": "us", "l": "english"},
-    )
+    r = safe_get("https://store.steampowered.com/api/appdetails", params={"appids": appid, "cc": "us", "l": "english"})
     if not r:
         return None
     try:
         data = r.json()
-        app  = data.get(str(appid), {})
+        app = data.get(str(appid), {})
         if not app.get("success"):
             return None
         return app["data"]
     except Exception as e:
-        log.error(f"Steam AppDetails error ({appid}): {e}")
+        log.error(f"Steam details error: {e}")
         return None
 
 def steam_get_reviews(appid: str):
-    r = safe_get(
-        f"https://store.steampowered.com/appreviews/{appid}",
-        params={"json": 1, "language": "all", "purchase_type": "all", "num_per_page": 0},
-    )
+    r = safe_get(f"https://store.steampowered.com/appreviews/{appid}", params={"json": 1, "language": "all", "purchase_type": "all", "num_per_page": 0})
     if not r:
         return None, None, ""
     try:
-        qs    = r.json().get("query_summary", {})
-        pos   = qs.get("total_positive", 0)
+        qs = r.json().get("query_summary", {})
+        pos = qs.get("total_positive", 0)
         total = qs.get("total_reviews", 0)
-        desc  = qs.get("review_score_desc", "")
+        desc = qs.get("review_score_desc", "")
         if total == 0:
             return None, None, ""
         return round(pos / total * 100), total, desc
@@ -1002,40 +797,32 @@ def steam_get_reviews(appid: str):
 def steam_get_promo_info(appid: str, is_ftk: bool) -> tuple[str, str, str]:
     start_date = ""
     end_date = ""
-    r = safe_get(f"https://store.steampowered.com/app/{appid}/", retries=2, delay=1)
+    r = safe_get(f"https://store.steampowered.com/app/{appid}/", retries=2)
     if r:
         try:
-            soup  = BeautifulSoup(r.text, "html.parser")
+            soup = BeautifulSoup(r.text, "html.parser")
             block = soup.select_one(".discount_block")
             if block:
-                text  = block.get_text(separator=" ", strip=True)
-                match_start = re.search(
-                    r"Offer starts\s+([\w]+\s+\d{1,2},\s+\d{4})",
-                    text, re.IGNORECASE
-                )
+                text = block.get_text(separator=" ", strip=True)
+                match_start = re.search(r"Offer starts\s+([\w]+\s+\d{1,2},\s+\d{4})", text, re.IGNORECASE)
                 if match_start:
                     try:
                         start_dt = datetime.datetime.strptime(match_start.group(1), "%b %d, %Y")
                         start_date = start_dt.strftime("%Y-%m-%d")
                     except:
                         pass
-                match_end = re.search(
-                    r"Offer ends\s+([\w]+\s+\d{1,2},\s+\d{4})",
-                    text, re.IGNORECASE
-                )
+                match_end = re.search(r"Offer ends\s+([\w]+\s+\d{1,2},\s+\d{4})", text, re.IGNORECASE)
                 if match_end:
                     try:
                         end_dt = datetime.datetime.strptime(match_end.group(1), "%b %d, %Y")
                         end_date = end_dt.strftime("%Y-%m-%d")
                     except:
                         pass
-        except Exception as e:
-            log.debug(f"Steam date extraction failed ({appid}): {e}")
-
+        except:
+            pass
     week = current_week_anchor()
     prefix = "FTK:" if is_ftk else ""
-    period_anchor = f"{prefix}{week}"
-    return start_date, end_date, period_anchor
+    return start_date, end_date, f"{prefix}{week}"
 
 def steam_is_free_to_play(appid: str) -> bool:
     details = steam_get_details(appid)
@@ -1043,8 +830,7 @@ def steam_is_free_to_play(appid: str) -> bool:
         if details.get("is_free", False):
             po = details.get("price_overview")
             if po:
-                final = po.get("final", 0)
-                if final == 0:
+                if po.get("final", 0) == 0:
                     return True
             else:
                 return True
@@ -1055,82 +841,58 @@ def fetch_steam_games() -> list[dict]:
     featured = _steam_fetch_featured()
     _merge(games, featured)
     log.info(f"Steam Source 1 (Featured):     {len(featured)}")
-
     html = _steam_fetch_html_search()
     before = len(games)
     _merge(games, html)
     log.info(f"Steam Source 2 (HTML Search):  {len(html)} raw → {len(games)-before} new")
-
     ftk = _steam_fetch_free_to_keep()
     before = len(games)
     _merge(games, ftk)
     log.info(f"Steam Source 3 (Free to Keep): {len(ftk)} raw → {len(games)-before} new")
-
     return games
 
-# ═══════════════════════════════════════════════════
-#  EPIC GAMES STORE
-# ═══════════════════════════════════════════════════
+# ─── Epic ──────────────────────────────────────────────────────────────
 EPIC_GQL_URL = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
 
 def fetch_epic_games() -> list[dict]:
     games = []
-    r = safe_get(
-        EPIC_GQL_URL,
-        params={"locale": "en-US", "country": "US", "allowCountries": "US"},
-        extra_headers={"Referer": "https://store.epicgames.com/"},
-    )
+    r = safe_get(EPIC_GQL_URL, params={"locale": "en-US", "country": "US", "allowCountries": "US"},
+                 extra_headers={"Referer": "https://store.epicgames.com/"})
     if not r:
         log.error("Epic API failed")
         return games
-
     try:
-        data     = r.json()
-        elements = (
-            data.get("data", {})
-                .get("Catalog", {})
-                .get("searchStore", {})
-                .get("elements", [])
-        )
+        data = r.json()
+        elements = data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
         now = datetime.datetime.utcnow()
-
         for el in elements:
             title = el.get("title", "").strip()
             if not title:
                 continue
-            
-            price_info = el.get("price", {})
-            total_price = price_info.get("totalPrice", {})
+            total_price = el.get("price", {}).get("totalPrice", {})
             if total_price.get("discountPrice", 0) == 0 and not el.get("promotions"):
                 continue
-            
-            promotions   = el.get("promotions") or {}
+            promotions = el.get("promotions") or {}
             promo_offers = promotions.get("promotionalOffers", [])
-            if not promo_offers:
-                continue
-
-            active_offer = None
-            for offer_group in promo_offers:
-                for offer in offer_group.get("promotionalOffers", []):
+            active = None
+            for group in promo_offers:
+                for offer in group.get("promotionalOffers", []):
                     start = offer.get("startDate", "")
-                    end   = offer.get("endDate", "")
+                    end = offer.get("endDate", "")
                     try:
-                        start_dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).replace(tzinfo=None)
-                        end_dt   = datetime.datetime.fromisoformat(end.replace("Z", "+00:00")).replace(tzinfo=None)
-                        if start_dt <= now <= end_dt:
-                            active_offer = {"start": start_dt, "end": end_dt}
+                        s = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).replace(tzinfo=None)
+                        e = datetime.datetime.fromisoformat(end.replace("Z", "+00:00")).replace(tzinfo=None)
+                        if s <= now <= e:
+                            active = {"start": s, "end": e}
                             break
                     except:
                         pass
-                if active_offer:
+                if active:
                     break
-
-            if not active_offer:
+            if not active:
                 continue
-
-            orig_cents  = total_price.get("originalPrice", 0)
-            orig_fmt    = f"${orig_cents/100:.2f}" if orig_cents else ""
-
+            orig_cents = total_price.get("originalPrice", 0)
+            orig_fmt = f"${orig_cents/100:.2f}" if orig_cents else ""
             image_url = ""
             for img_type in ("OfferImageWide", "DieselStoreFrontWide", "Thumbnail"):
                 for img in el.get("keyImages", []):
@@ -1139,98 +901,67 @@ def fetch_epic_games() -> list[dict]:
                         break
                 if image_url:
                     break
-
-            slug = (
-                el.get("catalogNs", {}).get("mappings", [{}])[0].get("pageSlug", "")
-                or el.get("productSlug", "")
-                or el.get("urlSlug", "")
-            )
+            slug = el.get("catalogNs", {}).get("mappings", [{}])[0].get("pageSlug", "") or el.get("productSlug", "") or el.get("urlSlug", "")
             link = f"https://store.epicgames.com/en-US/p/{slug}" if slug else "https://store.epicgames.com/en-US/free-games"
-
             game_id = el.get("id") or el.get("productSlug") or slug or title
-            end_display = active_offer["end"].strftime("%Y-%m-%d")
-
-            game = make_game(
-                "epic", str(game_id), title, 100,
-                link,
-                orig_fmt=orig_fmt,
-                final_fmt="FREE",
-                image_url=image_url,
-                is_free_to_keep=True,
-            )
-            game["deal_start"] = active_offer["start"].strftime("%Y-%m-%d")
-            game["deal_end"]   = end_display
+            end_display = active["end"].strftime("%Y-%m-%d")
+            game = make_game("epic", str(game_id), title, 100, link, orig_fmt=orig_fmt, final_fmt="FREE",
+                             image_url=image_url, is_free_to_keep=True)
+            game["deal_start"] = active["start"].strftime("%Y-%m-%d")
+            game["deal_end"] = end_display
             games.append(game)
             log.info(f"  ⬛ Epic Free: {title} (ends {end_display})")
-
     except Exception as e:
         log.error(f"Epic parse error: {e}")
-
     log.info(f"Epic Games total: {len(games)}")
     return games
 
 def epic_get_promo_info(game: dict) -> tuple[str, str, str]:
-    r = safe_get(
-        EPIC_GQL_URL,
-        params={"locale": "en-US", "country": "US", "allowCountries": "US"},
-        extra_headers={"Referer": "https://store.epicgames.com/"},
-    )
+    r = safe_get(EPIC_GQL_URL, params={"locale": "en-US", "country": "US", "allowCountries": "US"},
+                 extra_headers={"Referer": "https://store.epicgames.com/"})
     if not r:
         return "", "", f"FTK:{current_week_anchor()}"
-
     try:
-        data     = r.json()
-        elements = (
-            data.get("data", {})
-                .get("Catalog", {})
-                .get("searchStore", {})
-                .get("elements", [])
-        )
+        data = r.json()
+        elements = data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
         now = datetime.datetime.utcnow()
         for el in elements:
             eid = str(el.get("id") or el.get("productSlug") or "")
             if eid != game["id"] and el.get("title", "") != game["title"]:
                 continue
-            promotions   = el.get("promotions") or {}
-            promo_offers = promotions.get("promotionalOffers", [])
-            for offer_group in promo_offers:
-                for offer in offer_group.get("promotionalOffers", []):
+            promotions = el.get("promotions") or {}
+            for group in promotions.get("promotionalOffers", []):
+                for offer in group.get("promotionalOffers", []):
                     start = offer.get("startDate", "")
                     end = offer.get("endDate", "")
                     try:
-                        start_dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).replace(tzinfo=None)
-                        end_dt = datetime.datetime.fromisoformat(end.replace("Z", "+00:00")).replace(tzinfo=None)
-                        if end_dt > now:
-                            return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), f"FTK:{end_dt.strftime('%Y-%m-%d')}"
+                        s = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).replace(tzinfo=None)
+                        e = datetime.datetime.fromisoformat(end.replace("Z", "+00:00")).replace(tzinfo=None)
+                        if e > now:
+                            return s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"), f"FTK:{e.strftime('%Y-%m-%d')}"
                     except:
                         pass
     except:
         pass
-
     return "", "", f"FTK:{current_week_anchor()}"
 
-# ═══════════════════════════════════════════════════
-#  GOG با Smart Selector (به‌روز شده)
-# ═══════════════════════════════════════════════════
+# ─── GOG (API + اسکرپینگ) ─────────────────────────────────────────────
 def fetch_gog_games() -> list[dict]:
     games = []
-    
     log.info("  🔍 Fetching GOG via API (official)")
-    games_api = _gog_fetch_official_api()
-    _merge(games, games_api)
-    log.info(f"  GOG API: {len(games_api)} games")
-    
+    api_games = _gog_fetch_api()
+    _merge(games, api_games)
+    log.info(f"  GOG API: {len(api_games)} games")
     if len(games) < 5:
-        log.info("  🔍 Fetching GOG via Smart Selector")
-        games_smart = _gog_fetch_smart()
+        log.info("  🔍 Fetching GOG via Scraping")
+        scrape_games = _gog_fetch_scrape()
         before = len(games)
-        _merge(games, games_smart)
-        log.info(f"  GOG Smart: {len(games_smart)} raw → {len(games)-before} new")
-    
+        _merge(games, scrape_games)
+        log.info(f"  GOG Scrape: {len(scrape_games)} raw → {len(games)-before} new")
     log.info(f"  ✅ GOG total: {len(games)} games found")
     return games
 
-def _gog_fetch_official_api() -> list[dict]:
+def _gog_fetch_api() -> list[dict]:
     games = []
     url = "https://catalog.gog.com/v1/catalog"
     params = {
@@ -1243,8 +974,7 @@ def _gog_fetch_official_api() -> list[dict]:
         "currencyCode": "USD",
         "price": "0,1000"
     }
-    r = safe_get(url, params=params, use_scraper=True, retries=3, delay=2,
-                 extra_headers={"Referer": "https://www.gog.com/", "Accept": "application/json"})
+    r = safe_get(url, params=params, use_scraper=True, retries=3, extra_headers={"Referer": "https://www.gog.com/", "Accept": "application/json"})
     if not r:
         log.warning("  ⚠️ GOG API failed")
         return games
@@ -1278,252 +1008,302 @@ def _gog_fetch_official_api() -> list[dict]:
         log.warning(f"  ⚠️ GOG API parse error: {e}")
     return games
 
-def _gog_fetch_smart() -> list[dict]:
+def _gog_fetch_scrape() -> list[dict]:
     games = []
     urls = [
         "https://www.gog.com/en/games?discounted=true&page=1",
-        "https://www.gog.com/en/games?discounted=true&page=2",
-        "https://www.gog.com/en/games"
+        "https://www.gog.com/en/games?discounted=true&page=2"
     ]
-    
     r = None
     for url in urls:
-        log.info(f"    Trying: {url}")
-        r = safe_get(url, use_scraper=True, retries=2, delay=3,
-                     extra_headers={"Referer": "https://www.gog.com/"})
+        r = safe_get(url, use_scraper=True, retries=3, extra_headers={"Referer": "https://www.gog.com/"})
         if r:
             break
-    
     if not r:
-        log.warning("  ⚠️ GOG smart fetch failed")
+        log.warning("  ⚠️ GOG scrape failed")
         return games
-    
     soup = BeautifulSoup(r.text, "html.parser")
-    selector = SmartSelector(soup, "gog", "games")
-    
-    products = selector.find_elements("game_card_list")
-    log.info(f"    Found {len(products)} products using Smart Selector")
-    
+    # سلکتورهای جدید
+    products = soup.select("[data-testid='productCard']") or soup.select(".product-tile") or soup.select(".product-card")
+    if not products:
+        products = soup.select("a[href*='/en/game/']")
+    log.info(f"    Found {len(products)} potential products")
     for prod in products[:50]:
         try:
-            title = selector.get_text_safe(selector.find_element("title", parent=prod))
-            if not title:
+            title_el = prod.select_one("[data-testid='productTitle']") or prod.select_one(".product-title") or prod.select_one(".title")
+            if not title_el:
                 continue
-            
-            discount_el = selector.find_element("discount", parent=prod)
+            title = title_el.get_text(strip=True)
+            if not title or _should_skip(title):
+                continue
+            discount_el = prod.select_one("[data-testid='discountPercentage']") or prod.select_one(".discount-percentage")
             discount = 0
             if discount_el:
-                disc_text = discount_el.get_text(strip=True)
-                match = re.search(r'(\d+)%', disc_text)
-                if match:
-                    discount = int(match.group(1))
-            
+                disc_text = discount_el.get_text(strip=True).replace("%", "").replace("-", "")
+                try:
+                    discount = int(disc_text)
+                except:
+                    pass
             if discount == 0:
-                price_el = selector.find_element("price_final", parent=prod)
-                if price_el:
-                    price_text = price_el.get_text(strip=True).lower()
-                    if "free" in price_text:
-                        discount = 100
-            
+                price_el = prod.select_one(".final-price, .price")
+                if price_el and "free" in price_el.get_text(strip=True).lower():
+                    discount = 100
             if discount < MIN_DISCOUNT and discount != 100:
                 continue
-            
-            orig_el = selector.find_element("price_original", parent=prod)
-            final_el = selector.find_element("price_final", parent=prod)
-            orig = selector.get_text_safe(orig_el)
-            final = selector.get_text_safe(final_el)
-            
-            link_el = selector.find_element("link", parent=prod)
-            link = selector.get_attr_safe(link_el, "href", "")
+            orig_el = prod.select_one(".original-price, .old-price")
+            final_el = prod.select_one(".final-price, .current-price")
+            orig = orig_el.get_text(strip=True) if orig_el else ""
+            final = final_el.get_text(strip=True) if final_el else ""
+            link_el = prod.select_one("a[href*='/en/game/']")
+            link = link_el.get("href", "") if link_el else ""
             if link and not link.startswith("http"):
                 link = "https://www.gog.com" + link
             if not link or "/en/game/" not in link:
                 continue
-            
-            img_el = selector.find_element("image", parent=prod)
-            image_url = selector.get_attr_safe(img_el, "src", "") or selector.get_attr_safe(img_el, "data-src", "")
+            img_el = prod.select_one("img")
+            image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
             if image_url and image_url.startswith("//"):
                 image_url = "https:" + image_url
-            
-            game_id = ""
-            if link:
-                match = re.search(r"/game/([^/?]+)", link)
-                if match:
-                    game_id = match.group(1)
-            if not game_id:
-                game_id = title.lower().replace(" ", "-").replace(":", "")
-            
+            game_id = re.search(r"/game/([^/?]+)", link)
+            game_id = game_id.group(1) if game_id else title.lower().replace(" ", "-").replace(":", "")
             is_ftk = (discount == 100)
             game = make_game("gog", game_id, title, discount, link, orig, final, image_url, is_free_to_keep=is_ftk)
             games.append(game)
-            log.info(f"  🟣 GOG Smart: {title} -{discount}%")
-            
+            log.info(f"  🟣 GOG Scrape: {title} -{discount}%")
         except Exception as e:
             continue
-    
     return games
 
 def gog_get_promo_info(game: dict) -> tuple[str, str, str]:
-    r = safe_get(game["link"], retries=2, delay=1,
-                 extra_headers={"Referer": "https://www.gog.com/"})
-    start_date = ""
-    end_date = ""
+    r = safe_get(game["link"], retries=2, extra_headers={"Referer": "https://www.gog.com/"})
+    start = ""
+    end = ""
     if r:
         try:
             soup = BeautifulSoup(r.text, "html.parser")
-            for el in soup.select("[data-test-id='discountCountdown'], .discount-countdown, [class*='countdown']"):
+            for el in soup.select("[data-test-id='discountCountdown'], .discount-countdown"):
                 text = el.get_text(strip=True)
-                match_start = re.search(r"Starts\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
-                if match_start:
-                    start_date = match_start.group(1)
-                match_end = re.search(r"Ends\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
-                if match_end:
-                    end_date = match_end.group(1)
-        except Exception as e:
-            log.debug(f"GOG date extraction failed: {e}")
+                s = re.search(r"Starts\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
+                if s:
+                    start = s.group(1)
+                e = re.search(r"Ends\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
+                if e:
+                    end = e.group(1)
+        except:
+            pass
     week = current_week_anchor()
     prefix = "FTK:" if game.get("is_free_to_keep") else ""
-    period_anchor = f"{prefix}{week}"
-    return start_date, end_date, period_anchor
+    return start, end, f"{prefix}{week}"
 
-# ═══════════════════════════════════════════════════
-#  PLAYSTATION با Smart Selector
-# ═══════════════════════════════════════════════════
+# ─── PlayStation (Smart Selector + fallback) ──────────────────────────
+class SmartSelector:
+    def __init__(self, soup: BeautifulSoup, store: str, page_type: str):
+        self.soup = soup
+        self.store = store
+        self.page_type = page_type
+        self.cache_key = f"{store}_{page_type}"
+        self.selector_cache = self._load_cache()
+
+    def _load_cache(self):
+        try:
+            with open(SELECTORS_DB, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _save_cache(self, cache):
+        try:
+            with open(SELECTORS_DB, "w") as f:
+                json.dump(cache, f, indent=2)
+        except:
+            pass
+
+    def find_elements(self, target: str, parent=None) -> list:
+        soup_target = parent if parent else self.soup
+        cached = self.selector_cache.get(self.cache_key, {}).get(f"{target}_list")
+        if cached:
+            try:
+                res = soup_target.select(cached)
+                if res:
+                    return res
+            except:
+                pass
+        defaults = self._get_default_selectors(f"{target}_list")
+        for sel in defaults:
+            try:
+                res = soup_target.select(sel)
+                if res:
+                    self.selector_cache.setdefault(self.cache_key, {})[f"{target}_list"] = sel
+                    self._save_cache(self.selector_cache)
+                    return res
+            except:
+                continue
+        return []
+
+    def _get_default_selectors(self, target: str) -> list:
+        base = {
+            "game_card_list": [
+                "[data-testid='product-card']", ".product-card", ".product-tile",
+                "[class*='product']", "li[data-product-id]", "[class*='game']",
+                ".game-item", ".game-tile", "a[href*='/product/']", ".card", ".item"
+            ]
+        }
+        store_specific = {
+            "playstation": {
+                "game_card_list": ["[data-testid='product-card']", ".product-card", ".grid-cell", ".card"]
+            }
+        }
+        all_sel = base.get(target, [])
+        if self.store in store_specific:
+            all_sel = store_specific[self.store].get(target, []) + all_sel
+        return all_sel
+
+    def get_text_safe(self, el, default=""):
+        return el.get_text(strip=True) if el else default
+
+    def get_attr_safe(self, el, attr, default=""):
+        return el.get(attr, default) if el else default
+
+    def find_element(self, target: str, parent=None):
+        return None  # not used in PlayStation fetch
+
 def fetch_playstation_deals() -> list[dict]:
     games = []
     urls = [
         "https://store.playstation.com/en-us/pages/deals",
-        "https://store.playstation.com/en-us/deals",
+        "https://store.playstation.com/en-us/deals"
     ]
-    
     r = None
     for url in urls:
-        log.info(f"  🔍 Trying PlayStation Deals from {url}")
-        r = safe_get(url, use_scraper=True, retries=3, delay=3,
-                     extra_headers={"Referer": "https://store.playstation.com/"})
+        r = safe_get(url, use_scraper=True, retries=3, extra_headers={"Referer": "https://store.playstation.com/"})
         if r:
             break
-    
     if not r:
         log.error("  ❌ All PlayStation deals pages failed")
         return games
-    
     soup = BeautifulSoup(r.text, "html.parser")
     selector = SmartSelector(soup, "playstation", "deals")
-    
     products = selector.find_elements("game_card_list")
     log.info(f"  🔍 Found {len(products)} products using Smart Selector")
-    
     for prod in products[:50]:
         try:
-            title = selector.get_text_safe(selector.find_element("title", parent=prod))
-            if not title:
+            title_el = prod.select_one(".product-title, [data-testid='product-title'], h3, .title")
+            if not title_el:
                 continue
-            
-            discount_el = selector.find_element("discount", parent=prod)
+            title = title_el.get_text(strip=True)
+            if not title or _should_skip(title):
+                continue
+            discount_el = prod.select_one("[class*='discount'], .discount-badge")
             discount = 0
             if discount_el:
                 disc_text = discount_el.get_text(strip=True)
                 match = re.search(r'(\d+)%', disc_text)
                 if match:
                     discount = int(match.group(1))
-            
             if discount < MIN_DISCOUNT:
                 continue
-            
-            orig_el = selector.find_element("price_original", parent=prod)
-            final_el = selector.find_element("price_final", parent=prod)
-            orig = selector.get_text_safe(orig_el)
-            final = selector.get_text_safe(final_el)
-            
-            link_el = selector.find_element("link", parent=prod)
-            link = selector.get_attr_safe(link_el, "href", "")
+            link_el = prod.select_one("a[href*='/product/']")
+            link = link_el.get("href", "") if link_el else ""
             if link and not link.startswith("http"):
                 link = "https://store.playstation.com" + link
-            
-            img_el = selector.find_element("image", parent=prod)
-            image_url = selector.get_attr_safe(img_el, "src", "") or selector.get_attr_safe(img_el, "data-src", "")
+            img_el = prod.select_one("img")
+            image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
             if image_url and image_url.startswith("//"):
                 image_url = "https:" + image_url
             if image_url:
                 image_url = image_url.replace("_small", "_large").replace("_thumb", "_original")
-            
-            game_id = ""
-            if link:
-                match = re.search(r"/product/([^/?]+)", link)
-                if match:
-                    game_id = match.group(1)
-            if not game_id:
-                game_id = title.lower().replace(" ", "-").replace(":", "")
-            
+            game_id = re.search(r"/product/([^/?]+)", link)
+            game_id = game_id.group(1) if game_id else title.lower().replace(" ", "-").replace(":", "")
+            orig_el = prod.select_one(".price__old, .original-price")
+            final_el = prod.select_one(".price__current, .final-price")
+            orig = orig_el.get_text(strip=True) if orig_el else ""
+            final = final_el.get_text(strip=True) if final_el else ""
             game = make_game("playstation", game_id, title, discount, link, orig, final, image_url)
             games.append(game)
             log.info(f"  🎮 PS Deal: {title} -{discount}%")
-            
-        except Exception as e:
+        except:
             continue
-    
+    # اگر هیچی پیدا نشد، fallback به psdeals.net
+    if not games:
+        log.info("  🔍 Fallback to psdeals.net")
+        r2 = safe_get("https://psdeals.net/us-store/deals", use_scraper=True, retries=3)
+        if r2:
+            soup2 = BeautifulSoup(r2.text, "html.parser")
+            for item in soup2.select(".game-item, .deal-item"):
+                try:
+                    title_el = item.select_one(".title, .name")
+                    if not title_el:
+                        continue
+                    title = title_el.get_text(strip=True)
+                    if not title or _should_skip(title):
+                        continue
+                    disc_el = item.select_one(".discount, .price-off")
+                    discount = 0
+                    if disc_el:
+                        disc_text = disc_el.get_text(strip=True)
+                        match = re.search(r'(\d+)%', disc_text)
+                        if match:
+                            discount = int(match.group(1))
+                    if discount < MIN_DISCOUNT:
+                        continue
+                    link_el = item.select_one("a[href]")
+                    link = link_el.get("href", "") if link_el else ""
+                    if link and not link.startswith("http"):
+                        link = "https://psdeals.net" + link
+                    img_el = item.select_one("img")
+                    image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
+                    if image_url and image_url.startswith("//"):
+                        image_url = "https:" + image_url
+                    game_id = title.lower().replace(" ", "-").replace(":", "")
+                    game = make_game("playstation", game_id, title, discount, link, "", "", image_url)
+                    games.append(game)
+                    log.info(f"  🎮 PS Deal (fallback): {title} -{discount}%")
+                except:
+                    continue
     log.info(f"  ✅ PlayStation deals: {len(games)} games found")
     return games
 
 def playstation_get_promo_info(game: dict) -> tuple[str, str, str]:
     if not game.get("link"):
         return "", "", f"END:{current_week_anchor()}"
-    r = safe_get(game["link"], retries=2, delay=1, use_scraper=True,
-                 extra_headers={"Referer": "https://store.playstation.com/"})
-    start_date = ""
-    end_date = ""
+    r = safe_get(game["link"], retries=2, use_scraper=True, extra_headers={"Referer": "https://store.playstation.com/"})
+    start = ""
+    end = ""
     if r:
         try:
             soup = BeautifulSoup(r.text, "html.parser")
-            for el in soup.select(".offer-start, .countdown, [data-testid='offer-start']"):
+            for el in soup.select(".offer-start, .offer-end"):
                 text = el.get_text(strip=True)
                 match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text)
                 if match:
-                    try:
-                        start_dt = datetime.datetime.strptime(match.group(1), "%m/%d/%Y")
-                        start_date = start_dt.strftime("%Y-%m-%d")
-                    except:
-                        pass
-            for el in soup.select(".offer-end, .countdown, [data-testid='offer-end']"):
-                text = el.get_text(strip=True)
-                match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text)
-                if match:
-                    try:
-                        end_dt = datetime.datetime.strptime(match.group(1), "%m/%d/%Y")
-                        end_date = end_dt.strftime("%Y-%m-%d")
-                    except:
-                        pass
-        except Exception as e:
+                    dt = datetime.datetime.strptime(match.group(1), "%m/%d/%Y")
+                    if "start" in el.get("class", []):
+                        start = dt.strftime("%Y-%m-%d")
+                    else:
+                        end = dt.strftime("%Y-%m-%d")
+        except:
             pass
-    return start_date, end_date, f"END:{current_week_anchor()}"
+    return start, end, f"END:{current_week_anchor()}"
 
-# ═══════════════════════════════════════════════════
-#  AAA DETECTION
-# ═══════════════════════════════════════════════════
+# ─── AAA Detection ────────────────────────────────────────────────────
 def is_aaa_game_metacritic(title: str) -> bool:
     if RAWG_API_KEY:
         rawg = rawg_search(title)
         if rawg:
-            metacritic = rawg.get("metacritic")
-            rating_pct = rawg.get("rating_pct")
-            ratings_count = rawg.get("ratings_count", 0)
-            if metacritic and metacritic >= AAA_METACRITIC_THRESHOLD:
+            mc = rawg.get("metacritic")
+            rp = rawg.get("rating_pct")
+            rc = rawg.get("ratings_count", 0)
+            if mc and mc >= AAA_METACRITIC_THRESHOLD:
                 return True
-            if rating_pct and rating_pct >= AAA_RATING_THRESHOLD:
+            if rp and rp >= AAA_RATING_THRESHOLD:
                 return True
-            if ratings_count > AAA_REVIEWS_THRESHOLD:
+            if rc > AAA_REVIEWS_THRESHOLD:
                 return True
-    aaa_list = [
-        "halo", "forza", "gears of war", "starfield", "doom",
-        "cyberpunk", "witcher", "red dead", "gta", "assassin's creed",
-        "final fantasy", "resident evil", "god of war", "spider-man",
-        "horizon", "uncharted", "last of us", "ghost of tsushima",
-        "call of duty", "battlefield", "far cry", "diablo", "overwatch",
-        "fallout", "elder scrolls", "minecraft", "age of empires",
-        "dead space", "mass effect", "dragon age", "batman",
-        "arkham", "tomb raider", "wolfenstein", "prey", "dishonored"
-    ]
+    aaa_list = ["halo","forza","gears of war","starfield","doom","cyberpunk","witcher","red dead",
+                "gta","assassin's creed","final fantasy","resident evil","god of war","spider-man",
+                "horizon","uncharted","last of us","ghost of tsushima","call of duty","battlefield",
+                "far cry","diablo","overwatch","fallout","elder scrolls","minecraft","age of empires",
+                "dead space","mass effect","dragon age","batman","arkham","tomb raider","wolfenstein"]
     return any(aaa in title.lower() for aaa in aaa_list)
 
 def enrich_from_metacritic(game: dict) -> bool:
@@ -1549,68 +1329,49 @@ def enrich_from_metacritic(game: dict) -> bool:
         game["release_date"] = rawg["released"]
     return True
 
-# ═══════════════════════════════════════════════════
-#  PS PLUS ESSENTIAL / EXTRA
-# ═══════════════════════════════════════════════════
+# ─── PS Plus Essential / Extra ──────────────────────────────────────
 def fetch_playstation_plus_essential() -> list[dict]:
     games = []
     log.info("  🔍 Fetching PS Plus Essential from official PlayStation Blog RSS")
     try:
-        rss_url = "https://blog.playstation.com/feed/"
-        feed = feedparser.parse(rss_url)
+        feed = feedparser.parse("https://blog.playstation.com/feed/")
         for entry in feed.entries[:30]:
-            title = entry.title
-            if "PlayStation Plus" not in title and "PS Plus" not in title:
+            if "PlayStation Plus" not in entry.title and "PS Plus" not in entry.title:
                 continue
             content = entry.content[0].value if hasattr(entry, 'content') else entry.description
-            full_text = title + " " + content
-            pattern1 = r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*,\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*(?:,?\s*and\s*|\s*&\s*)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'
-            matches = re.findall(pattern1, full_text)
+            full = entry.title + " " + content
+            pattern = r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*,\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*(?:,?\s*and\s*|\s*&\s*)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'
+            matches = re.findall(pattern, full)
             if matches:
                 for match in matches[0]:
-                    game_name = match.strip()
-                    if len(game_name) > 3 and not any(x in game_name.lower() for x in ["plus", "playstation", "member", "download", "month"]):
-                        game_id = game_name.lower().replace(" ", "-").replace(":", "").replace("'", "")
-                        games.append(make_game(
-                            "playstation_essential", game_id, game_name, 100,
-                            entry.link, "", "FREE (PS Plus Essential)", "",
-                            is_free_to_keep=True
-                        ))
+                    name = match.strip()
+                    if len(name) > 3 and not any(x in name.lower() for x in ["plus", "playstation", "member", "download", "month"]):
+                        gid = name.lower().replace(" ", "-").replace(":", "").replace("'", "")
+                        games.append(make_game("playstation_essential", gid, name, 100,
+                            entry.link, "", "FREE (PS Plus Essential)", "", is_free_to_keep=True))
                 if games:
                     log.info(f"    Found {len(games)} games from RSS")
                     return games
-            famous_games = [
-                "God of War", "Horizon", "Uncharted", "The Last of Us",
-                "Final Fantasy", "Resident Evil", "Cyberpunk", "The Witcher",
-                "Red Dead", "GTA", "Assassin's Creed", "Far Cry",
-                "Ghost of Tsushima", "Death Stranding", "Days Gone",
-                "Demon's Souls", "Ratchet and Clank", "Returnal",
-                "Spider-Man", "Diablo", "Overwatch", "Doom",
-                "Fallout", "Elder Scrolls", "Minecraft", "Age of Empires"
-            ]
-            for game in famous_games:
-                if game.lower() in full_text.lower():
-                    game_id = game.lower().replace(" ", "-").replace(":", "").replace("'", "")
-                    games.append(make_game(
-                        "playstation_essential", game_id, game, 100,
-                        entry.link, "", "FREE (PS Plus Essential)", "",
-                        is_free_to_keep=True
-                    ))
+            famous = ["God of War", "Horizon", "Uncharted", "The Last of Us", "Final Fantasy",
+                      "Resident Evil", "Cyberpunk", "The Witcher", "Red Dead", "GTA",
+                      "Assassin's Creed", "Far Cry", "Ghost of Tsushima", "Death Stranding",
+                      "Days Gone", "Demon's Souls", "Ratchet and Clank", "Returnal",
+                      "Spider-Man", "Diablo", "Overwatch", "Doom", "Fallout", "Elder Scrolls",
+                      "Minecraft", "Age of Empires"]
+            for game in famous:
+                if game.lower() in full.lower():
+                    gid = game.lower().replace(" ", "-").replace(":", "").replace("'", "")
+                    games.append(make_game("playstation_essential", gid, game, 100,
+                        entry.link, "", "FREE (PS Plus Essential)", "", is_free_to_keep=True))
     except Exception as e:
         log.warning(f"  ⚠️ RSS error: {e}")
     if not games:
-        log.info("  🔍 Fallback: using static list of current PS Plus games")
-        current_games = [
-            ("God of War Ragnarök", "god-of-war-ragnarok"),
-            ("The Last of Us Part I", "the-last-of-us-part-i"),
-            ("Final Fantasy VII Remake", "final-fantasy-vii-remake"),
-        ]
-        for title, game_id in current_games:
-            games.append(make_game(
-                "playstation_essential", game_id, title, 100,
-                "https://blog.playstation.com", "", "FREE (PS Plus Essential)", "",
-                is_free_to_keep=True
-            ))
+        log.info("  🔍 Fallback: using static list")
+        for title, gid in [("God of War Ragnarök", "god-of-war-ragnarok"),
+                           ("The Last of Us Part I", "the-last-of-us-part-i"),
+                           ("Final Fantasy VII Remake", "final-fantasy-vii-remake")]:
+            games.append(make_game("playstation_essential", gid, title, 100,
+                "https://blog.playstation.com", "", "FREE (PS Plus Essential)", "", is_free_to_keep=True))
     log.info(f"  ✅ PS Essential: {len(games)} games found")
     return games
 
@@ -1618,53 +1379,36 @@ def fetch_playstation_plus_extra() -> list[dict]:
     games = []
     log.info("  🔍 Fetching PS Plus Extra from official PlayStation Blog RSS")
     try:
-        rss_url = "https://blog.playstation.com/feed/"
-        feed = feedparser.parse(rss_url)
+        feed = feedparser.parse("https://blog.playstation.com/feed/")
         for entry in feed.entries[:30]:
-            title = entry.title
-            if "PS Plus Extra" not in title and "PlayStation Plus Extra" not in title:
+            if "PS Plus Extra" not in entry.title and "PlayStation Plus Extra" not in entry.title:
                 continue
             content = entry.content[0].value if hasattr(entry, 'content') else entry.description
-            full_text = title + " " + content
-            aaa_games = [
-                "God of War", "Horizon", "Uncharted", "The Last of Us",
-                "Final Fantasy", "Resident Evil", "Cyberpunk", "The Witcher",
-                "Red Dead", "GTA", "Assassin's Creed", "Far Cry",
-                "Ghost of Tsushima", "Death Stranding", "Days Gone",
-                "Demon's Souls", "Ratchet and Clank", "Returnal",
-                "Spider-Man", "Diablo", "Overwatch", "Doom",
-                "Fallout", "Elder Scrolls", "Minecraft", "Age of Empires",
-                "Dead Space", "Mass Effect", "Dragon Age", "Batman"
-            ]
-            for game in aaa_games:
-                if game.lower() in full_text.lower():
-                    game_id = game.lower().replace(" ", "-").replace(":", "").replace("'", "")
-                    games.append(make_game(
-                        "playstation_extra", game_id, game, 0,
-                        entry.link, "", "Included in PS Plus Extra", "",
-                        is_free_to_keep=False
-                    ))
+            full = entry.title + " " + content
+            aaa = ["God of War", "Horizon", "Uncharted", "The Last of Us", "Final Fantasy",
+                   "Resident Evil", "Cyberpunk", "The Witcher", "Red Dead", "GTA",
+                   "Assassin's Creed", "Far Cry", "Ghost of Tsushima", "Death Stranding",
+                   "Days Gone", "Demon's Souls", "Ratchet and Clank", "Returnal",
+                   "Spider-Man", "Diablo", "Overwatch", "Doom", "Fallout", "Elder Scrolls",
+                   "Minecraft", "Age of Empires", "Dead Space", "Mass Effect", "Dragon Age", "Batman"]
+            for game in aaa:
+                if game.lower() in full.lower():
+                    gid = game.lower().replace(" ", "-").replace(":", "").replace("'", "")
+                    games.append(make_game("playstation_extra", gid, game, 0,
+                        entry.link, "", "Included in PS Plus Extra", "", is_free_to_keep=False))
     except Exception as e:
         log.warning(f"  ⚠️ RSS Extra error: {e}")
     if not games:
-        log.info("  🔍 Fallback: using static list of current PS Plus Extra games")
-        current_extra_games = [
-            ("God of War Ragnarök", "god-of-war-ragnarok"),
-            ("Horizon Forbidden West", "horizon-forbidden-west"),
-            ("The Last of Us Part I", "the-last-of-us-part-i"),
-        ]
-        for title, game_id in current_extra_games:
-            games.append(make_game(
-                "playstation_extra", game_id, title, 0,
-                "https://blog.playstation.com", "", "Included in PS Plus Extra", "",
-                is_free_to_keep=False
-            ))
+        log.info("  🔍 Fallback: using static list")
+        for title, gid in [("God of War Ragnarök", "god-of-war-ragnarok"),
+                           ("Horizon Forbidden West", "horizon-forbidden-west"),
+                           ("The Last of Us Part I", "the-last-of-us-part-i")]:
+            games.append(make_game("playstation_extra", gid, title, 0,
+                "https://blog.playstation.com", "", "Included in PS Plus Extra", "", is_free_to_keep=False))
     log.info(f"  ✅ PS Extra: {len(games)} games found")
     return games
 
-# ═══════════════════════════════════════════════════
-#  XBOX GAME PASS
-# ═══════════════════════════════════════════════════
+# ─── Xbox Game Pass ────────────────────────────────────────────────────
 def fetch_xbox_gamepass() -> list[dict]:
     games = []
     log.info("  🔍 Fetching Xbox Game Pass with Metacritic detection")
@@ -1704,218 +1448,24 @@ def fetch_xbox_gamepass() -> list[dict]:
         if not is_aaa_game_metacritic(title):
             log.debug(f"  ⏭️ Skipping {title} (not AAA)")
             continue
-        if steam_id > 0:
-            if steam_is_free_to_play(str(steam_id)):
-                log.debug(f"  ⏭️ Skipping {title} (Free to Play)")
-                continue
+        if steam_id > 0 and steam_is_free_to_play(str(steam_id)):
+            log.debug(f"  ⏭️ Skipping {title} (Free to Play)")
+            continue
         image_url = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{steam_id}/capsule_616x353.jpg"
         if steam_id == 0:
             rawg = rawg_search(title)
             if rawg and rawg.get("background_image"):
                 image_url = rawg["background_image"]
-        game = make_game("xbox_gamepass", slug, title, 0, "https://www.xbox.com/en-US/xbox-game-pass", "", "Included in Game Pass", image_url, is_free_to_keep=False)
+        game = make_game("xbox_gamepass", slug, title, 0,
+            "https://www.xbox.com/en-US/xbox-game-pass", "", "Included in Game Pass", image_url, is_free_to_keep=False)
         games.append(game)
         log.info(f"  🟩 Xbox Game Pass (AAA): {title}")
     log.info(f"  ✅ Xbox Game Pass: {len(games)} AAA games")
     return games
 
-# ═══════════════════════════════════════════════════
-#  SMART SELECTOR SYSTEM
-# ═══════════════════════════════════════════════════
-
-def load_selector_cache() -> dict:
-    try:
-        with open(SELECTORS_DB, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_selector_cache(cache: dict):
-    try:
-        with open(SELECTORS_DB, "w") as f:
-            json.dump(cache, f, indent=2)
-    except:
-        pass
-
-class SmartSelector:
-    def __init__(self, soup: BeautifulSoup, store: str, page_type: str):
-        self.soup = soup
-        self.store = store
-        self.page_type = page_type
-        self.cache_key = f"{store}_{page_type}"
-        self.selector_cache = load_selector_cache()
-    
-    def find_element(self, target: str, parent=None, fallback_selectors: list = None):
-        soup_target = parent if parent else self.soup
-        
-        cached_selector = self.selector_cache.get(self.cache_key, {}).get(target)
-        if cached_selector:
-            try:
-                result = soup_target.select_one(cached_selector)
-                if result:
-                    return result
-            except:
-                pass
-        
-        default_selectors = self._get_default_selectors(target)
-        all_selectors = default_selectors + (fallback_selectors or [])
-        
-        for selector in all_selectors:
-            try:
-                result = soup_target.select_one(selector)
-                if result:
-                    if self.cache_key not in self.selector_cache:
-                        self.selector_cache[self.cache_key] = {}
-                    self.selector_cache[self.cache_key][target] = selector
-                    save_selector_cache(self.selector_cache)
-                    return result
-            except:
-                continue
-        
-        return None
-    
-    def find_elements(self, target: str, parent=None, fallback_selectors: list = None) -> list:
-        soup_target = parent if parent else self.soup
-        
-        cached_selector = self.selector_cache.get(self.cache_key, {}).get(f"{target}_list")
-        if cached_selector:
-            try:
-                results = soup_target.select(cached_selector)
-                if results:
-                    return results
-            except:
-                pass
-        
-        default_selectors = self._get_default_selectors(f"{target}_list")
-        all_selectors = default_selectors + (fallback_selectors or [])
-        
-        for selector in all_selectors:
-            try:
-                results = soup_target.select(selector)
-                if results:
-                    if self.cache_key not in self.selector_cache:
-                        self.selector_cache[self.cache_key] = {}
-                    self.selector_cache[self.cache_key][f"{target}_list"] = selector
-                    save_selector_cache(self.selector_cache)
-                    return results
-            except:
-                continue
-        
-        return []
-    
-    def _get_default_selectors(self, target: str) -> list:
-        base_selectors = {
-            "title": [
-                "[data-testid='productTitle']",
-                "[data-qa*='title']",
-                ".product-title",
-                ".title",
-                "h3, h4",
-                "[class*='title']",
-                "[class*='name']"
-            ],
-            "title_list": [
-                "[data-testid='productTitle']",
-                ".product-title",
-                ".title",
-                "h3, h4",
-                "[class*='title']"
-            ],
-            "discount": [
-                "[data-testid='discountPercentage']",
-                "[data-qa*='discount']",
-                ".discount-percentage",
-                ".discount",
-                "[class*='discount']",
-                ".price__discount"
-            ],
-            "price_original": [
-                ".original-price",
-                ".price__old",
-                ".old-price",
-                "[class*='original']",
-                ".strike-through",
-                ".was"
-            ],
-            "price_final": [
-                ".final-price",
-                ".price__current",
-                ".current-price",
-                "[class*='final']",
-                ".price",
-                ".now"
-            ],
-            "image": [
-                "img",
-                "[data-testid='productImage']",
-                "[class*='image'] img",
-                ".cover img"
-            ],
-            "link": [
-                "a[href*='/product/']",
-                "a[href*='/game/']",
-                "a[href*='/app/']",
-                "a[href]"
-            ],
-            "game_card_list": [
-                "[data-testid='productCard']",
-                ".product-card",
-                ".product-tile",
-                "[class*='product']",
-                "li[data-product-id]",
-                "[class*='game']",
-                ".game-item",
-                ".game-tile",
-                "a[href*='/product/']",
-                "a[href*='/game/']",
-                ".card",
-                ".item",
-                "[data-qa*='product']"
-            ]
-        }
-        
-        store_specific = {
-            "gog": {
-                "title": ["[data-testid='productTitle']", ".product-title", ".title"],
-                "discount": ["[data-testid='discountPercentage']", ".discount-percentage"],
-                "price_original": [".original-price", ".old-price"],
-                "price_final": [".final-price", ".current-price"],
-                "game_card_list": ["[data-testid='productCard']", ".product-tile", ".product-card", ".card", ".item"]
-            },
-            "playstation": {
-                "title": ["[data-testid='product-title']", ".product-title", ".title"],
-                "discount": ["[data-testid='discount-badge']", ".discount-badge"],
-                "price_original": ["[data-testid='original-price']", ".original-price", ".price__old"],
-                "price_final": ["[data-testid='final-price']", ".final-price", ".price__current"],
-                "game_card_list": ["[data-testid='product-card']", ".product-card", ".grid-cell", ".card", ".item"]
-            }
-        }
-        
-        all_selectors = base_selectors.get(target, [])
-        if self.store in store_specific:
-            all_selectors = store_specific[self.store].get(target, []) + all_selectors
-        
-        return all_selectors
-    
-    def get_text_safe(self, element, default: str = "") -> str:
-        if element:
-            return element.get_text(strip=True)
-        return default
-    
-    def get_attr_safe(self, element, attr: str, default: str = "") -> str:
-        if element:
-            return element.get(attr, default)
-        return default
-
-# ═══════════════════════════════════════════════════
-#  STEAM SEARCH ENRICH
-# ═══════════════════════════════════════════════════
+# ─── Steam Search Enrich ──────────────────────────────────────────────
 def steam_search_by_title(title: str) -> str | None:
-    r = safe_get(
-        "https://store.steampowered.com/search/",
-        params={"term": title, "cc": "US", "l": "english"},
-        retries=2, delay=1
-    )
+    r = safe_get("https://store.steampowered.com/search/", params={"term": title, "cc": "US", "l": "english"}, retries=2)
     if not r:
         return None
     try:
@@ -1927,11 +1477,9 @@ def steam_search_by_title(title: str) -> str | None:
             appid = href.split("/app/")[1].split("/")[0]
             if appid.isdigit():
                 title_el = row.select_one(".title")
-                if title_el:
-                    result_title = title_el.text.strip().lower()
-                    if title.lower() in result_title or result_title in title.lower():
-                        return appid
-    except Exception as e:
+                if title_el and title.lower() in title_el.text.strip().lower():
+                    return appid
+    except:
         pass
     return None
 
@@ -1945,8 +1493,7 @@ def enrich_from_steam(game: dict) -> bool:
     if not details:
         return False
     if not game.get("description"):
-        raw = details.get("short_description", "")
-        game["description"] = BeautifulSoup(raw, "html.parser").get_text() if raw else ""
+        game["description"] = BeautifulSoup(details.get("short_description", ""), "html.parser").get_text()
     if not game.get("genres"):
         game["genres"] = [g["description"] for g in details.get("genres", [])]
     if not game.get("review_pct"):
@@ -1956,33 +1503,29 @@ def enrich_from_steam(game: dict) -> bool:
             game["review_count"] = rev_count
             game["review_desc"] = rev_desc
     game["steam_image"] = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"
-    if details.get("is_free", False):
-        if not game.get("is_free_to_keep"):
-            game["is_free_to_play"] = True
+    if details.get("is_free", False) and not game.get("is_free_to_keep"):
+        game["is_free_to_play"] = True
     return True
 
-# ═══════════════════════════════════════════════════
-#  CAPTION BUILDER
-# ═══════════════════════════════════════════════════
+# ─── Caption Builder ───────────────────────────────────────────────────
 def build_caption(game: dict, start_date: str, end_date: str) -> str:
-    store    = game["store"]
-    meta     = STORE_META[store]
-    is_ftk   = game.get("is_free_to_keep", False)
+    store = game["store"]
+    meta = STORE_META[store]
+    is_ftk = game.get("is_free_to_keep", False)
     discount = game["discount"]
-    title    = game["title"]
+    title = game["title"]
     deal_type = detect_deal_type(game)
     deal_emoji = get_deal_emoji(deal_type)
     deal_label = get_deal_label(deal_type, discount)
-    
+
     raw_desc = game.get("description") or "No description available."
     raw_desc = BeautifulSoup(raw_desc, "html.parser").get_text()
-    desc     = raw_desc[:260].rstrip() + ("…" if len(raw_desc) > 260 else "")
-    
-    rev_pct   = game.get("review_pct")
+    desc = raw_desc[:260].rstrip() + ("…" if len(raw_desc) > 260 else "")
+
+    rev_pct = game.get("review_pct")
     rev_count = game.get("review_count")
-    rev_desc  = game.get("review_desc", "")
+    rev_desc = game.get("review_desc", "")
     metacritic = game.get("metacritic")
-    
     if rev_pct is not None and rev_count:
         mood = "🟢" if rev_pct >= 80 else ("🟡" if rev_pct >= 60 else "🔴")
         if store == "steam":
@@ -1993,23 +1536,20 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
                 review_line += f"  |  Metacritic: <b>{metacritic}</b>"
     else:
         review_line = None
-    
-    genres    = game.get("genres") or []
+
+    genres = game.get("genres") or []
     genre_str = ", ".join(genres[:4]) if genres else None
-    
-    orig  = game.get("price_orig_fmt", "")
+
+    orig = game.get("price_orig_fmt", "")
     final = game.get("price_final_fmt", "")
-    
+
     if discount == 100:
         price_block = f"<s>{orig}</s> → <b>FREE</b>" if orig else "<b>FREE</b>"
-        disc_block  = f"{deal_emoji} {deal_label}"
+        disc_block = f"{deal_emoji} {deal_label}"
     else:
-        price_block = (
-            f"<s>{orig}</s> → <b>{final}</b>"
-            if orig and final else (final or orig or "?")
-        )
+        price_block = f"<s>{orig}</s> → <b>{final}</b>" if orig and final else (final or orig or "?")
         disc_block = f"<b>-{discount}%</b> 🔥"
-    
+
     tags = ["#FreeGamesHub", meta["tag"]]
     for g in genres[:2]:
         tag = re.sub(r'[^a-zA-Z0-9]', '', g)
@@ -2023,42 +1563,34 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
         tags.append("#BigDeal")
     if discount >= 90:
         tags.append("#MegaDeal")
-    if game.get("is_aaa", False):
+    if game.get("is_aaa"):
         tags.append("#AAA")
     hashtags = " ".join(tags)
-    
+
     now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-    
+
     lines = [
         f"{meta['emoji']} <b>[{meta['name']}]</b>  🎮 <b>{title}</b>",
         "",
     ]
-    
     if genre_str:
         lines += [f"🎯 <b>Genre:</b> {genre_str}", ""]
-    
     if desc and desc != "No description available.":
         lines += ["📝 <b>About:</b>", desc, ""]
-    
     if review_line:
         label = "Steam Reviews" if store == "steam" else "Rating"
         lines += [f"⭐ <b>{label}:</b> {review_line}", ""]
-    
     lines += [
         f"💰 <b>Price:</b> {price_block}",
         f"💸 <b>Discount:</b> {disc_block}",
         "",
     ]
-    
     if start_date or end_date:
         lines += ["📅 <b>Offer Calendar:</b>", ""]
         if start_date:
-            formatted_start = format_date_persian_english(start_date)
-            lines += [f"  🟢 <b>Start:</b> {formatted_start}", ""]
+            lines += [f"  🟢 <b>Start:</b> {format_date_persian_english(start_date)}", ""]
         if end_date:
-            formatted_end = format_date_persian_english(end_date)
-            lines += [f"  🔴 <b>End:</b> {formatted_end}", ""]
-    
+            lines += [f"  🔴 <b>End:</b> {format_date_persian_english(end_date)}", ""]
     lines += [
         f"📅 <b>Detected:</b> {now_utc} UTC",
         "",
@@ -2066,9 +1598,7 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
         "",
         hashtags,
     ]
-    
     caption = "\n".join(lines)
-    
     if len(caption) > 1024:
         short = raw_desc[:80].rstrip() + "…"
         new_lines = []
@@ -2078,7 +1608,6 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
                 continue
             new_lines.append(line)
         caption = "\n".join(new_lines)
-    
     if len(caption) > 1024:
         new_lines, skip = [], False
         for line in lines:
@@ -2091,77 +1620,57 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
             if not skip:
                 new_lines.append(line)
         caption = "\n".join(new_lines)[:1024]
-    
     return caption
 
-# ═══════════════════════════════════════════════════
-#  TELEGRAM SENDER
-# ═══════════════════════════════════════════════════
+# ─── Telegram Sender ──────────────────────────────────────────────────
 def send_game(game: dict, caption: str) -> bool:
-    url        = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     candidates = get_image_candidates(game)
     candidates = [c for c in candidates if c]
-    
     for img in candidates:
         try:
-            r = requests.post(url, data={
-                "chat_id":    CHANNEL,
-                "photo":      img,
-                "caption":    caption,
-                "parse_mode": "HTML",
-            }, timeout=30)
-            result = r.json()
-            if result.get("ok"):
+            r = requests.post(url, data={"chat_id": CHANNEL, "photo": img, "caption": caption, "parse_mode": "HTML"}, timeout=30)
+            if r.json().get("ok"):
                 return True
-            err = result.get("description", "")
+            err = r.json().get("description", "")
             log.warning(f"Telegram error: {err}")
             if "can't parse" in err.lower():
                 clean = BeautifulSoup(caption, "html.parser").get_text()
-                r2 = requests.post(url, data={
-                    "chat_id": CHANNEL, "photo": img, "caption": clean[:1024],
-                }, timeout=30)
+                r2 = requests.post(url, data={"chat_id": CHANNEL, "photo": img, "caption": clean[:1024]}, timeout=30)
                 if r2.json().get("ok"):
                     return True
             if "wrong type" in err or "failed" in err:
                 continue
         except Exception as e:
             log.error(f"Send exception: {e}")
-    
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHANNEL, "text": caption, "parse_mode": "HTML"},
-            timeout=30,
-        )
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                          data={"chat_id": CHANNEL, "text": caption, "parse_mode": "HTML"}, timeout=30)
         if r.json().get("ok"):
             return True
     except Exception as e:
         log.error(f"sendMessage fallback failed: {e}")
-    
     return False
 
-# ═══════════════════════════════════════════════════
-#  PROCESS ONE GAME
-# ═══════════════════════════════════════════════════
+# ─── Process One Game ─────────────────────────────────────────────────
+AI_ENGINE = None
+
 def process_game(game: dict) -> tuple[str, str]:
     global AI_ENGINE
-    
-    store  = game["store"]
-    gid    = game["id"]
-    title  = game["title"]
+    store = game["store"]
+    gid = game["id"]
+    title = game["title"]
     is_ftk = game.get("is_free_to_keep", False)
-    
+
     if is_recently_sent_cached(store, gid):
         return "skipped", "sent within last 24 hours (cache)"
-    
     if game.get("is_free_to_play", False) and not is_ftk:
         return "invalid", "Free to Play (permanent)"
-    
-    # ─── دریافت تاریخ‌ها ──────────────────────────────────────────
+
     start_date = game.get("deal_start", "")
     end_date = game.get("deal_end", "")
     period_anchor = ""
-    
+
     if store == "steam" and gid.isdigit():
         start_date, end_date, period_anchor = steam_get_promo_info(gid, is_ftk)
     elif store == "epic":
@@ -2176,8 +1685,7 @@ def process_game(game: dict) -> tuple[str, str]:
         period_anchor = f"GAMEPASS:{datetime.datetime.utcnow().strftime('%Y-%m')}"
     else:
         period_anchor = current_week_anchor()
-    
-    # ─── تکمیل اطلاعات ──────────────────────────────────────────
+
     if store == "steam":
         details = steam_get_details(gid)
         if not details:
@@ -2193,32 +1701,28 @@ def process_game(game: dict) -> tuple[str, str]:
             return "invalid", f"discount {disc}% < {MIN_DISCOUNT}%"
         po = details.get("price_overview") or {}
         if po:
-            game["price_orig_fmt"]  = po.get("initial_formatted", game.get("price_orig_fmt", ""))
-            game["price_final_fmt"] = po.get("final_formatted",   game.get("price_final_fmt", ""))
-            game["discount"]        = po.get("discount_percent",  game["discount"])
+            game["price_orig_fmt"] = po.get("initial_formatted", game.get("price_orig_fmt", ""))
+            game["price_final_fmt"] = po.get("final_formatted", game.get("price_final_fmt", ""))
+            game["discount"] = po.get("discount_percent", game["discount"])
         raw = details.get("short_description", "")
         game["description"] = BeautifulSoup(raw, "html.parser").get_text() if raw else ""
-        game["genres"]      = [g["description"] for g in details.get("genres", [])]
+        game["genres"] = [g["description"] for g in details.get("genres", [])]
         rev_pct, rev_count, rev_desc = steam_get_reviews(gid)
-        game["review_pct"]   = rev_pct
+        game["review_pct"] = rev_pct
         game["review_count"] = rev_count
-        game["review_desc"]  = rev_desc
-    
+        game["review_desc"] = rev_desc
     elif store == "epic":
         enrich_epic_gog(game)
         if not game.get("genres") or not game.get("description"):
             enrich_from_steam(game)
-    
     elif store == "gog":
         enrich_epic_gog(game)
         if not game.get("genres") or not game.get("description"):
             enrich_from_steam(game)
-    
     elif store == "playstation":
         enrich_from_steam(game)
         if not game.get("genres") or not game.get("description"):
             enrich_from_metacritic(game)
-    
     elif store in ["playstation_essential", "playstation_extra"]:
         enrich_from_steam(game)
         if not game.get("genres") or not game.get("description"):
@@ -2227,7 +1731,6 @@ def process_game(game: dict) -> tuple[str, str]:
             game["genres"] = ["Action", "Adventure"]
         if not game.get("description"):
             game["description"] = f"🎮 {game['title']} is included in PS Plus!"
-    
     elif store == "xbox_gamepass":
         enrich_from_steam(game)
         if not game.get("genres") or not game.get("description"):
@@ -2242,49 +1745,38 @@ def process_game(game: dict) -> tuple[str, str]:
             game["review_desc"] = "Highly Rated"
         if is_recently_sent_db(store, gid, days=365):
             return "skipped", "sent within last year"
-    
     else:
         return "failed", f"unknown store {store}"
-    
-    # ─── تشخیص AAA ──────────────────────────────────────────────
+
     game["is_aaa"] = is_aaa_game_metacritic(game["title"])
     calculate_priority_score(game)
-    
-    # ─── تصمیم‌گیری با هوش مصنوعی ──────────────────────────────
+
     if AI_ENGINE:
         is_valid, reason, corrections = AI_ENGINE.decide(game)
-        
         if corrections:
-            for key, value in corrections.items():
-                if key in game:
-                    game[key] = value
-                    log.info(f"   🔧 AI corrected {key}: {value}")
-        
+            for k, v in corrections.items():
+                if k in game:
+                    game[k] = v
         AI_ENGINE.log_decision(game, "accepted" if is_valid else "rejected", reason)
-        
         if not is_valid:
             log.info(f"   🤖 AI rejected: {reason}")
             return "invalid", f"AI: {reason}"
         else:
             log.info(f"   🤖 AI accepted: {reason}")
-    
-    # ─── Dedup ──────────────────────────────────────────────────
+
     deal_hash = game.get("deal_hash", "")
     if not deal_hash:
         deal_hash = get_deal_hash(game)
     if not deal_hash:
         deal_hash = make_promo_key(store, gid, period_anchor)
-    
+
     if not is_deal_changed(store, gid, deal_hash):
         return "skipped", "no change in deal"
-    
     if is_sent(store, gid, deal_hash):
         return "skipped", "already sent this deal"
-    
-    # ─── ارسال ──────────────────────────────────────────────────
+
     caption = build_caption(game, start_date, end_date)
     ok = send_game(game, caption)
-    
     if ok:
         mark_sent(store, gid, title, deal_hash)
         mark_sent_cached(store, gid)
@@ -2292,129 +1784,116 @@ def process_game(game: dict) -> tuple[str, str]:
     else:
         return "failed", "telegram send error"
 
-# ═══════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════
+# ─── Main ─────────────────────────────────────────────────────────────
 def main():
     global AI_ENGINE
-    
     log.info("═" * 65)
     log.info("  🎮 FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox")
     log.info("  🤖 AI Decision Engine: ENABLED")
     log.info("═" * 65)
-    
+
     if not BOT_TOKEN or not CHANNEL:
         log.error("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL not set")
         return
-    
+
     if not RAWG_API_KEY:
         log.warning("⚠️  RAWG_API_KEY not set — some stores may lack genre/description")
-    
     if not JDT_AVAILABLE:
         log.warning("⚠️  jdatetime not installed — Persian dates will not be shown. Install with: pip install jdatetime")
-    
-    # ─── مقداردهی AI ────────────────────────────────────────────
+
     AI_ENGINE = AIDecisionEngine()
-    
     init_db()
-    
+
     all_games = []
-    
+
     log.info("── Fetching Steam ──────────────────────────────────────")
     steam_games = fetch_steam_games()
     _merge(all_games, steam_games)
-    
+
     log.info("── Fetching Epic ───────────────────────────────────────")
     epic_games = fetch_epic_games()
     _merge(all_games, epic_games)
-    
+
     log.info("── Fetching GOG ────────────────────────────────────────")
     gog_games = fetch_gog_games()
     _merge(all_games, gog_games)
-    
+
     log.info("── Fetching PlayStation Deals ─────────────────────────")
     ps_deals = fetch_playstation_deals()
     _merge(all_games, ps_deals)
-    
+
     log.info("── Fetching PS Plus Essential ─────────────────────────")
     ps_essential = fetch_playstation_plus_essential()
     _merge(all_games, ps_essential)
-    
+
     log.info("── Fetching PS Plus Extra ─────────────────────────────")
     ps_extra = fetch_playstation_plus_extra()
     _merge(all_games, ps_extra)
-    
+
     log.info("── Fetching Xbox Game Pass ────────────────────────────")
     xbox_games = fetch_xbox_gamepass()
     _merge(all_games, xbox_games)
-    
+
     log.info(f"Total unique deals before filtering: {len(all_games)}")
-    
-    # ─── فیلتر Free to Play ────────────────────────────────────
-    filtered_games = []
+
+    # فیلتر Free to Play
+    filtered = []
     for g in all_games:
         if g.get("is_free_to_play", False) and not g.get("is_free_to_keep", False):
-            log.debug(f"  ⏭️ Filtered Free to Play: {g['title']}")
             continue
-        if g["store"] == "steam" and g["id"].isdigit():
-            if steam_is_free_to_play(g["id"]) and not g.get("is_free_to_keep", False):
-                log.debug(f"  ⏭️ Filtered Free to Play (Steam): {g['title']}")
-                continue
-        filtered_games.append(g)
-    
-    all_games = filtered_games
+        if g["store"] == "steam" and g["id"].isdigit() and steam_is_free_to_play(g["id"]) and not g.get("is_free_to_keep", False):
+            continue
+        filtered.append(g)
+    all_games = filtered
     log.info(f"Total after filtering Free to Play: {len(all_games)}")
-    
+
     if not all_games:
         log.warning("No games found — exiting")
         return
-    
-    # ─── محاسبه Priority Score ──────────────────────────────────
+
     for g in all_games:
         calculate_priority_score(g)
-    
-    # ─── گروه‌بندی ──────────────────────────────────────────────
+
+    # گروه‌بندی
     pc_stores = ["steam", "epic", "gog"]
     ps_stores = ["playstation", "playstation_essential", "playstation_extra"]
     xbox_stores = ["xbox_gamepass"]
-    
+
     pc_games = [g for g in all_games if g["store"] in pc_stores]
     ps_games = [g for g in all_games if g["store"] in ps_stores]
-    xbox_games_filtered = [g for g in all_games if g["store"] in xbox_stores]
-    
+    xbox_games_f = [g for g in all_games if g["store"] in xbox_stores]
+
     pc_games.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
     ps_games.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
-    xbox_games_filtered.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
-    
-    log.info(f"  📊 Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_filtered)}")
-    
+    xbox_games_f.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
+
+    log.info(f"  📊 Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_f)}")
+
     groups = [
         ("PC", pc_games),
         ("PS", ps_games),
-        ("Xbox", xbox_games_filtered),
+        ("Xbox", xbox_games_f),
     ]
     groups = [(name, games) for name, games in groups if games]
-    
+
     counters = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
-    total_games = sum(len(games) for _, games in groups)
-    sent_count = 0
+    total = sum(len(g) for _, g in groups)
+    sent = 0
     ai_rejected = 0
-    
-    while sent_count < total_games:
+
+    while sent < total:
         for group_name, games in groups:
             if not games:
                 continue
             game = games.pop(0)
-            sent_count += 1
-            
+            sent += 1
             store = game["store"].upper()
             label = "🎁 FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
             priority = game.get("priority_score", 0)
-            log.info(f"[{sent_count:3}/{total_games}] [{group_name:<4}][{store:<5}] {game['title'][:40]:<40} | {label} | Score:{priority}")
-            
+            log.info(f"[{sent:3}/{total}] [{group_name:<4}][{store:<5}] {game['title'][:40]:<40} | {label} | Score:{priority}")
+
             status, reason = process_game(game)
             counters[status] = counters.get(status, 0) + 1
-            
             if status == "sent":
                 log.info("       ✅ Sent")
             elif status == "skipped":
@@ -2425,10 +1904,8 @@ def main():
                     ai_rejected += 1
             else:
                 log.error(f"       ❌ Failed — {reason}")
-            
             time.sleep(3)
-    
-    # ─── گزارش نهایی ────────────────────────────────────────────
+
     log.info("═" * 65)
     log.info(f"  ✅ Sent:     {counters['sent']}")
     log.info(f"  ⏭  Skipped: {counters['skipped']}")
@@ -2436,9 +1913,6 @@ def main():
     log.info(f"  ❌ Failed:   {counters['failed']}")
     log.info("═" * 65)
 
-# ═══════════════════════════════════════════════════
-#  اجرای خودکار هر ۱۲ ساعت
-# ═══════════════════════════════════════════════════
 if __name__ == "__main__":
     while True:
         try:
