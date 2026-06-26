@@ -1,13 +1,13 @@
 """
 FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-نسخه نهایی با تشخیص AAA با Metacritic
+نسخه نهایی با ارسال چرخشی (PC → PS → Xbox)
 - دریافت خودکار تخفیف‌ها و بازی‌های رایگان از فروشگاه‌های معتبر
 - تشخیص بازی‌های AAA با Metacritic (≥75) و RAWG Rating (≥80%)
 - تکمیل اطلاعات از RAWG و Steam
 - کش ۲۴ ساعته برای جلوگیری از ارسال تکراری
 - حداقل تخفیف: ۷۵٪
-- ترکیب چند منبع برای PS Plus و Xbox (افزایش دقت و پایداری)
+- ارسال چرخشی: PC → PS → Xbox → PC → PS → Xbox → ...
 - اجرای خودکار هر ۱۲ ساعت
 """
 
@@ -781,130 +781,327 @@ def epic_get_promo_info(game: dict) -> tuple[str, str]:
     return "Unknown", f"FTK:{current_week_anchor()}"
 
 # ═══════════════════════════════════════════════════
-#  GOG
+#  GOG — نسخه بهبودیافته با سلکتورهای جدید
 # ═══════════════════════════════════════════════════
-def fetch_gog_games() -> list[dict]:
-    games = []
-    gog_sales  = _gog_fetch_sales()
-    _merge(games, gog_sales)
-    log.info(f"GOG Source 1 (Sales):      {len(gog_sales)}")
 
-    gog_free = _gog_fetch_free()
-    before   = len(games)
-    _merge(games, gog_free)
-    log.info(f"GOG Source 2 (Free):       {len(gog_free)} raw → {len(games)-before} new")
+def fetch_gog_games() -> list[dict]:
+    """گرفتن بازی‌های GOG با تخفیف ≥۷۵٪ و رایگان"""
+    games = []
+    
+    # منبع ۱: API رسمی GOG (با پارامترهای جدید)
+    log.info("  🔍 Fetching GOG via API")
+    games_api = _gog_fetch_api()
+    _merge(games, games_api)
+    log.info(f"  GOG API: {len(games_api)} games")
+    
+    # منبع ۲: اسکرپینگ صفحه اصلی (برای بازی‌های رایگان)
+    log.info("  🔍 Fetching GOG via scraping")
+    games_scrape = _gog_fetch_scrape()
+    before = len(games)
+    _merge(games, games_scrape)
+    log.info(f"  GOG Scrape: {len(games_scrape)} raw → {len(games)-before} new")
+    
+    # منبع ۳: صفحه تخفیف‌های ویژه
+    log.info("  🔍 Fetching GOG via specials page")
+    games_specials = _gog_fetch_specials()
+    before = len(games)
+    _merge(games, games_specials)
+    log.info(f"  GOG Specials: {len(games_specials)} raw → {len(games)-before} new")
+    
+    log.info(f"  ✅ GOG total: {len(games)} games found")
     return games
 
-def _gog_fetch_sales() -> list[dict]:
+def _gog_fetch_api() -> list[dict]:
+    """گرفتن بازی‌ها از API رسمی GOG با پارامترهای به‌روز"""
     games = []
-    r = safe_get(
-        "https://catalog.gog.com/v1/catalog",
-        params={
-            "limit":      48,
-            "order":      "desc:trending",
-            "discounted": "true",
-            "productType": "in:game",
-            "page":       1,
-        },
-        extra_headers={"Referer": "https://www.gog.com/"},
-    )
+    
+    # API جدید GOG
+    url = "https://catalog.gog.com/v1/catalog"
+    params = {
+        "limit": 100,
+        "order": "desc:trending",
+        "discounted": "true",
+        "productType": "in:game,dlc",
+        "page": 1,
+        "countryCode": "US",
+        "currencyCode": "USD"
+    }
+    
+    r = safe_get(url, params=params, use_scraper=True, retries=3, delay=2,
+                 extra_headers={"Referer": "https://www.gog.com/"})
+    
     if not r:
+        log.warning("  ⚠️ GOG API failed")
         return games
+    
     try:
         data = r.json()
-        for item in data.get("products", []):
+        products = data.get("products", [])
+        
+        for item in products:
             title = item.get("title", "").strip()
             if not title or _should_skip(title):
                 continue
-
-            price_info = item.get("price", {}) or {}
-            discount   = int(price_info.get("discountPercentage", 0) or 0)
+            
+            # استخراج قیمت و تخفیف
+            price_info = item.get("price", {})
+            if not price_info:
+                continue
+            
+            discount = int(price_info.get("discountPercentage", 0) or 0)
+            
+            # فیلتر تخفیف ≥۷۵٪ یا رایگان
             if discount < MIN_DISCOUNT and discount != 100:
                 continue
-
-            orig_raw   = float(price_info.get("base",  0) or 0)
-            final_raw  = float(price_info.get("final", 0) or 0)
-            orig_fmt   = f"${orig_raw:.2f}"  if orig_raw  else ""
-            final_fmt  = f"${final_raw:.2f}" if final_raw else ("FREE" if discount == 100 else "")
-
-            slug     = item.get("slug", "")
-            link     = f"https://www.gog.com/en/game/{slug}" if slug else "https://www.gog.com"
-            cover    = item.get("coverHorizontal", "") or item.get("cover", "")
-            game_id  = str(item.get("id", slug or title))
-            is_ftk   = (discount == 100 and final_raw == 0)
-
+            
+            # قیمت‌ها
+            base_price = price_info.get("base", 0)
+            final_price = price_info.get("final", 0)
+            
+            orig_fmt = f"${float(base_price):.2f}" if base_price else ""
+            final_fmt = f"${float(final_price):.2f}" if final_price else ("FREE" if discount == 100 else "")
+            
+            # لینک
+            slug = item.get("slug", "")
+            link = f"https://www.gog.com/en/game/{slug}" if slug else "https://www.gog.com"
+            
+            # تصویر
+            cover = item.get("coverHorizontal", "") or item.get("cover", "")
+            
+            game_id = str(item.get("id", slug or title))
+            is_ftk = (discount == 100 and final_price == 0)
+            
             game = make_game(
                 "gog", game_id, title, discount,
                 link, orig_fmt, final_fmt,
                 image_url=cover,
-                is_free_to_keep=is_ftk,
+                is_free_to_keep=is_ftk
             )
             games.append(game)
-            if is_ftk:
-                log.info(f"  🟣 GOG Free: {title}")
-            else:
-                log.info(f"  🟣 GOG Sale: {title} -{discount}%")
-
+            log.info(f"  🟣 GOG API: {title} -{discount}%")
+            
     except Exception as e:
-        log.error(f"GOG sales parse error: {e}")
+        log.warning(f"  ⚠️ GOG API parse error: {e}")
+    
     return games
 
-def _gog_fetch_free() -> list[dict]:
+def _gog_fetch_scrape() -> list[dict]:
+    """اسکرپینگ صفحه GOG برای بازی‌های رایگان و تخفیفی"""
     games = []
-    r = safe_get(
+    
+    # صفحه اصلی GOG
+    urls = [
         "https://www.gog.com/en/games",
-        params={"priceRange": "0,0", "discounted": "true"},
-        extra_headers={"Referer": "https://www.gog.com/"},
-        use_scraper=True,
-    )
+        "https://www.gog.com/en/games?discounted=true",
+        "https://www.gog.com/en/games?priceRange=0,0"
+    ]
+    
+    for url in urls:
+        r = safe_get(url, use_scraper=True, retries=3, delay=3,
+                     extra_headers={"Referer": "https://www.gog.com/"})
+        if r:
+            break
+    
     if not r:
+        log.warning("  ⚠️ GOG scrape failed")
         return games
+    
     try:
         soup = BeautifulSoup(r.text, "html.parser")
-        for card in soup.select("[data-test-id='productCard'], .product-tile, [class*='productCard']"):
+        
+        # سلکتورهای جدید GOG (بر اساس ساختار فعلی)
+        products = (
+            soup.select("[data-testid='productCard']") or
+            soup.select(".product-tile") or
+            soup.select(".product-card") or
+            soup.select("[class*='product']") or
+            soup.select("[data-product-id]")
+        )
+        
+        # اگر هیچ محصولی پیدا نشد، از سلکتورهای عمومی استفاده کن
+        if not products:
+            products = soup.select("a[href*='/en/game/']")
+            # فیلتر کردن لینک‌های تکراری
+            seen = set()
+            unique_products = []
+            for p in products:
+                href = p.get("href", "")
+                if href and href not in seen:
+                    seen.add(href)
+                    unique_products.append(p)
+            products = unique_products
+        
+        for prod in products[:50]:
             try:
+                # استخراج عنوان
                 title_el = (
-                    card.select_one("[data-test-id='productTitle']")
-                    or card.select_one(".product-tile__title")
-                    or card.select_one("[class*='productTitle']")
+                    prod.select_one("[data-testid='productTitle']") or
+                    prod.select_one(".product-title") or
+                    prod.select_one(".title") or
+                    prod.select_one("h3, h4") or
+                    prod.select_one("[class*='title']")
                 )
                 if not title_el:
                     continue
                 title = title_el.get_text(strip=True)
                 if not title or _should_skip(title):
                     continue
-
-                link_el = card.select_one("a[href*='/game/'], a[href*='/en/game/']")
-                if not link_el:
-                    continue
-                href    = link_el.get("href", "")
-                slug    = href.rstrip("/").split("/")[-1]
-                link    = f"https://www.gog.com/en/game/{slug}"
-                game_id = slug or title
-
-                img_el    = card.select_one("img")
-                image_url = img_el.get("src", "") if img_el else ""
-
-                price_el = (
-                    card.select_one("[data-test-id='finalPrice']")
-                    or card.select_one(".product-tile__price-final")
+                
+                # استخراج تخفیف
+                discount_el = (
+                    prod.select_one("[data-testid='discountPercentage']") or
+                    prod.select_one(".discount-percentage") or
+                    prod.select_one("[class*='discount']")
                 )
-                if price_el:
-                    price_text = price_el.get_text(strip=True).lower()
-                    if "free" not in price_text and price_text not in ("$0.00", "0", "0.00"):
-                        continue
-
-                games.append(make_game(
-                    "gog", game_id, title, 100,
-                    link, orig_fmt="", final_fmt="FREE",
-                    image_url=image_url,
-                    is_free_to_keep=True,
-                ))
-                log.info(f"  🟣 GOG Free (HTML): {title}")
+                discount = 0
+                if discount_el:
+                    disc_text = discount_el.get_text(strip=True).replace("%", "").replace("-", "")
+                    try:
+                        discount = int(disc_text)
+                    except:
+                        pass
+                
+                # اگر تخفیف پیدا نشد، از قیمت‌ها استفاده کن
+                if discount == 0:
+                    price_el = prod.select_one(".final-price, .price, [class*='price']")
+                    if price_el:
+                        price_text = price_el.get_text(strip=True).lower()
+                        if "free" in price_text:
+                            discount = 100
+                
+                if discount < MIN_DISCOUNT and discount != 100:
+                    continue
+                
+                # استخراج قیمت‌ها
+                orig_el = prod.select_one(".original-price, .old-price, [class*='original']")
+                final_el = prod.select_one(".final-price, .current-price, [class*='final']")
+                orig = orig_el.get_text(strip=True) if orig_el else ""
+                final = final_el.get_text(strip=True) if final_el else ""
+                
+                # استخراج لینک
+                link_el = prod.select_one("a[href*='/en/game/']")
+                if not link_el:
+                    link_el = prod
+                link = link_el.get("href", "") if link_el else ""
+                if link and not link.startswith("http"):
+                    link = "https://www.gog.com" + link
+                if not link or "/en/game/" not in link:
+                    continue
+                
+                # استخراج تصویر
+                img_el = prod.select_one("img")
+                image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
+                if image_url and image_url.startswith("//"):
+                    image_url = "https:" + image_url
+                if image_url:
+                    image_url = image_url.replace("_small", "_large").replace("_thumb", "_original")
+                
+                # استخراج ID بازی
+                game_id = ""
+                if link:
+                    match = re.search(r"/game/([^/?]+)", link)
+                    if match:
+                        game_id = match.group(1)
+                if not game_id:
+                    game_id = title.lower().replace(" ", "-").replace(":", "")
+                
+                is_ftk = (discount == 100)
+                
+                game = make_game(
+                    "gog", game_id, title, discount,
+                    link, orig, final, image_url,
+                    is_free_to_keep=is_ftk
+                )
+                games.append(game)
+                log.info(f"  🟣 GOG Scrape: {title} -{discount}%")
+                
             except Exception as e:
-                log.debug(f"GOG card parse error: {e}")
+                continue
+                
     except Exception as e:
-        log.error(f"GOG free HTML error: {e}")
+        log.warning(f"  ⚠️ GOG scrape parse error: {e}")
+    
+    return games
+
+def _gog_fetch_specials() -> list[dict]:
+    """گرفتن بازی‌ها از صفحه تخفیف‌های ویژه GOG"""
+    games = []
+    
+    url = "https://www.gog.com/en/games?discounted=true&page=1"
+    r = safe_get(url, use_scraper=True, retries=3, delay=3,
+                 extra_headers={"Referer": "https://www.gog.com/"})
+    
+    if not r:
+        return games
+    
+    try:
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        # پیدا کردن تمام کارت‌های بازی
+        cards = (
+            soup.select("[data-testid='productCard']") or
+            soup.select(".product-tile") or
+            soup.select("[class*='product']")
+        )
+        
+        for card in cards[:30]:
+            try:
+                # عنوان
+                title_el = card.select_one("[data-testid='productTitle'], .title, h3")
+                if not title_el:
+                    continue
+                title = title_el.get_text(strip=True)
+                if not title or _should_skip(title):
+                    continue
+                
+                # تخفیف
+                disc_el = card.select_one("[class*='discount']")
+                discount = 0
+                if disc_el:
+                    disc_text = disc_el.get_text(strip=True).replace("%", "").replace("-", "")
+                    try:
+                        discount = int(disc_text)
+                    except:
+                        pass
+                
+                if discount < MIN_DISCOUNT and discount != 100:
+                    continue
+                
+                # لینک
+                link_el = card.select_one("a[href*='/en/game/']")
+                link = link_el.get("href", "") if link_el else ""
+                if link and not link.startswith("http"):
+                    link = "https://www.gog.com" + link
+                
+                # تصویر
+                img_el = card.select_one("img")
+                image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
+                if image_url and image_url.startswith("//"):
+                    image_url = "https:" + image_url
+                
+                game_id = ""
+                if link:
+                    match = re.search(r"/game/([^/?]+)", link)
+                    if match:
+                        game_id = match.group(1)
+                if not game_id:
+                    game_id = title.lower().replace(" ", "-")
+                
+                is_ftk = (discount == 100)
+                
+                game = make_game(
+                    "gog", game_id, title, discount,
+                    link, "", "", image_url,
+                    is_free_to_keep=is_ftk
+                )
+                games.append(game)
+                
+            except Exception as e:
+                continue
+                
+    except Exception as e:
+        log.warning(f"  ⚠️ GOG specials parse error: {e}")
+    
     return games
 
 def gog_get_promo_info(game: dict) -> tuple[str, str]:
@@ -1704,8 +1901,9 @@ def process_game(game: dict) -> tuple[str, str]:
         return "failed", "telegram send error"
 
 # ═══════════════════════════════════════════════════
-#  MAIN
+#  MAIN — با ارسال چرخشی (PC → PS → Xbox)
 # ═══════════════════════════════════════════════════
+
 def main():
     log.info("═" * 65)
     log.info("  🎮 FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox")
@@ -1756,32 +1954,72 @@ def main():
         log.warning("No games found — exiting")
         return
 
+    # ─── مرتب‌سازی اولیه ──────────────────────────────────────────
+    # اولویت: FTK > 100% > تخفیف بیشتر
     all_games.sort(key=lambda x: (
         x.get("is_free_to_keep", False),
         x["discount"] == 100,
         x["discount"],
     ), reverse=True)
 
+    # ─── گروه‌بندی بر اساس فروشگاه ──────────────────────────────
+    pc_stores = ["steam", "epic", "gog"]
+    ps_stores = ["playstation", "playstation_essential", "playstation_extra"]
+    xbox_stores = ["xbox_gamepass"]
+
+    pc_games = [g for g in all_games if g["store"] in pc_stores]
+    ps_games = [g for g in all_games if g["store"] in ps_stores]
+    xbox_games_filtered = [g for g in all_games if g["store"] in xbox_stores]
+
+    # ─── مرتب‌سازی هر گروه (FTK اول) ─────────────────────────────
+    pc_games.sort(key=lambda x: (not x.get("is_free_to_keep", False), -x["discount"]))
+    ps_games.sort(key=lambda x: (not x.get("is_free_to_keep", False), -x["discount"]))
+    xbox_games_filtered.sort(key=lambda x: (not x.get("is_free_to_keep", False), -x["discount"]))
+
+    log.info(f"  📊 Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_filtered)}")
+
+    # ─── ارسال چرخشی (Round-Robin) ──────────────────────────────
+    # PC → PS → Xbox → PC → PS → Xbox → ...
+    groups = [
+        ("PC", pc_games),
+        ("PS", ps_games),
+        ("Xbox", xbox_games_filtered),
+    ]
+
+    # حذف گروه‌های خالی
+    groups = [(name, games) for name, games in groups if games]
+
     counters = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
+    total_games = sum(len(games) for _, games in groups)
+    sent_count = 0
 
-    for idx, game in enumerate(all_games, 1):
-        store  = game["store"].upper()
-        label  = "🎁 FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
-        log.info(f"[{idx:3}/{len(all_games)}] [{store:<5}] {game['title'][:45]:<45} | {label}")
+    # ارسال چرخشی تا زمانی که همه بازی‌ها ارسال شوند
+    while sent_count < total_games:
+        for group_name, games in groups:
+            if not games:
+                continue
+            
+            # یک بازی از این گروه بردار
+            game = games.pop(0)
+            sent_count += 1
+            
+            store = game["store"].upper()
+            label = "🎁 FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
+            log.info(f"[{sent_count:3}/{total_games}] [{group_name:<4}][{store:<5}] {game['title'][:40]:<40} | {label}")
 
-        status, reason = process_game(game)
-        counters[status] = counters.get(status, 0) + 1
+            status, reason = process_game(game)
+            counters[status] = counters.get(status, 0) + 1
 
-        if status == "sent":
-            log.info("       ✅ Sent")
-        elif status == "skipped":
-            log.info(f"       ⏭  Skipped — {reason}")
-        elif status == "invalid":
-            log.info(f"       ⚠️  Invalid — {reason}")
-        else:
-            log.error(f"       ❌ Failed — {reason}")
+            if status == "sent":
+                log.info("       ✅ Sent")
+            elif status == "skipped":
+                log.info(f"       ⏭  Skipped — {reason}")
+            elif status == "invalid":
+                log.info(f"       ⚠️  Invalid — {reason}")
+            else:
+                log.error(f"       ❌ Failed — {reason}")
 
-        time.sleep(3)
+            time.sleep(3)  # تأخیر بین ارسال‌ها
 
     log.info("═" * 65)
     log.info(f"  ✅ Sent:    {counters['sent']}")
