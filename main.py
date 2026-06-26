@@ -4,10 +4,11 @@ FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 - دریافت خودکار تخفیف‌ها و بازی‌های رایگان از فروشگاه‌های معتبر
 - ارسال به کانال تلگرام با تصویر استاندارد 616×353
 - تکمیل اطلاعات (ژانر، توضیحات، نقدها) از RAWG و در صورت نیاز از Steam
-- تشخیص تغییرات تخفیف با هش ترکیبی (شروع، پایان، قیمت) برای جلوگیری از ارسال تکراری
-- پشتیبانی از PlayStation Deals (≥۹۰٪), PS Plus Essential (ماهانه), PS Plus Extra (AAA جدید)
+- تشخیص تغییرات تخفیف با هش ترکیبی (شروع، پایان، قیمت) + کش ۲۴ ساعته برای جلوگیری از ارسال تکراری
+- پشتیبانی از PlayStation Deals (≥۷۵٪), PS Plus Essential (ماهانه), PS Plus Extra (AAA جدید)
 - پشتیبانی از Xbox Game Pass Standard (AAA جدید)
 - اجرای خودکار هر ۱۲ ساعت
+- حداقل تخفیف: ۷۵٪ (قابل تنظیم)
 """
 
 import os
@@ -38,7 +39,7 @@ BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
 RAWG_API_KEY = os.environ.get("RAWG_API_KEY", "")
 DB_FILE      = "games.db"
-MIN_DISCOUNT = 90
+MIN_DISCOUNT = 75  # ← تغییر از ۹۰ به ۷۵
 
 SCRAPER = cloudscraper.create_scraper()
 
@@ -67,6 +68,24 @@ STORE_META = {
 }
 
 # ═══════════════════════════════════════════════════
+#  CACHE ۲۴ ساعته (در حافظه)
+# ═══════════════════════════════════════════════════
+SENT_CACHE = {}  # کلید: (store, game_id) → مقدار: datetime ارسال
+
+def is_recently_sent_cached(store: str, game_id: str, hours: int = 24) -> bool:
+    """بررسی می‌کند که آیا بازی در hours ساعت اخیر ارسال شده است"""
+    key = (store, game_id)
+    if key in SENT_CACHE:
+        last_sent = SENT_CACHE[key]
+        if (datetime.datetime.utcnow() - last_sent).total_seconds() < hours * 3600:
+            return True
+    return False
+
+def mark_sent_cached(store: str, game_id: str):
+    """علامت‌گذاری ارسال در کش"""
+    SENT_CACHE[(store, game_id)] = datetime.datetime.utcnow()
+
+# ═══════════════════════════════════════════════════
 #  DATABASE
 # ═══════════════════════════════════════════════════
 def init_db():
@@ -90,13 +109,6 @@ def init_db():
             last_price TEXT,
             updated_at TEXT,
             PRIMARY KEY (store, game_id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS monthly_check (
-            store      TEXT,
-            last_check TEXT,
-            PRIMARY KEY (store)
         )
     """)
     conn.commit()
@@ -129,7 +141,7 @@ def current_week_anchor() -> str:
     iso = datetime.datetime.utcnow().isocalendar()
     return f"WEEK:{iso[0]}-W{iso[1]:02d}"
 
-# ─── توابع جدید برای dedup ──────────────────────────────────────────────
+# ─── توابع dedup ────────────────────────────────────
 
 def get_deal_hash(game: dict) -> str:
     """ساخت هش از ترکیب start, end, price_final"""
@@ -153,7 +165,7 @@ def is_deal_changed(store: str, game_id: str, current_hash: str) -> bool:
         return True
     return row[0] != current_hash
 
-def is_recently_sent(store: str, game_id: str, days: int = 365) -> bool:
+def is_recently_sent_db(store: str, game_id: str, days: int = 365) -> bool:
     """بررسی می‌کند که آیا بازی در days روز اخیر ارسال شده است"""
     conn = sqlite3.connect(DB_FILE)
     row = conn.execute(
@@ -169,26 +181,6 @@ def is_recently_sent(store: str, game_id: str, days: int = 365) -> bool:
         return diff < days
     except:
         return False
-
-def should_check_monthly(store: str) -> bool:
-    conn = sqlite3.connect(DB_FILE)
-    row = conn.execute(
-        "SELECT last_check FROM monthly_check WHERE store=?",
-        (store,)
-    ).fetchone()
-    today = datetime.date.today().isoformat()
-    if not row:
-        conn.execute("INSERT INTO monthly_check (store, last_check) VALUES (?, ?)", (store, today))
-        conn.commit()
-        conn.close()
-        return True
-    if row[0] != today:
-        conn.execute("UPDATE monthly_check SET last_check=? WHERE store=?", (today, store))
-        conn.commit()
-        conn.close()
-        return True
-    conn.close()
-    return False
 
 # ═══════════════════════════════════════════════════
 #  HTTP HELPER
@@ -354,8 +346,8 @@ def make_game(store: str, game_id: str, title: str, discount: int,
         "review_desc":      review_desc,
         "metacritic":       None,
         "rawg_image":       "",
-        "deal_start":       "",   # برای dedup
-        "deal_end":         "",   # برای dedup
+        "deal_start":       "",
+        "deal_end":         "",
     }
 
 def _merge(base: list, new_items: list):
@@ -836,7 +828,6 @@ def _gog_fetch_sales() -> list[dict]:
                 image_url=cover,
                 is_free_to_keep=is_ftk,
             )
-            # GOG معمولاً تاریخ تخفیف رو نداره، می‌ذاریم خالی
             games.append(game)
             if is_ftk:
                 log.info(f"  🟣 GOG Free: {title}")
@@ -926,17 +917,21 @@ def gog_get_promo_info(game: dict) -> tuple[str, str]:
     return "Unknown", f"{prefix}{week}"
 
 # ═══════════════════════════════════════════════════
-#  PLAYSTATION — اسکرپینگ مستقیم
+#  PLAYSTATION — اسکرپینگ مستقیم (با سلکتورهای مقاوم)
 # ═══════════════════════════════════════════════════
 def fetch_playstation_deals() -> list[dict]:
-    """بازی‌های با تخفیف ≥۹۰٪ از فروشگاه PlayStation"""
+    """بازی‌های با تخفیف ≥۷۵٪ از فروشگاه PlayStation"""
     games = []
-    url = "https://store.playstation.com/en-us/deals"
-
-    log.info(f"  🔍 Scraping PlayStation deals from {url}")
-    r = safe_get(url, use_scraper=True, retries=3, delay=3,
-                 extra_headers={"Referer": "https://store.playstation.com/"})
-
+    urls = [
+        "https://store.playstation.com/en-us/deals",
+        "https://store.playstation.com/en-us/deals?direction=desc&sort=release_date",
+    ]
+    r = None
+    for url in urls:
+        r = safe_get(url, use_scraper=True, retries=3, delay=3,
+                     extra_headers={"Referer": "https://store.playstation.com/"})
+        if r:
+            break
     if not r:
         log.error("  ❌ PlayStation deals page not accessible")
         return games
@@ -947,19 +942,22 @@ def fetch_playstation_deals() -> list[dict]:
             soup.select(".product-card") or
             soup.select("[data-testid='product-card']") or
             soup.select(".grid-cell") or
-            soup.select(".product-grid .product")
+            soup.select(".product") or
+            soup.select("[class*='product']") or
+            soup.select("li[data-product-id]") or
+            soup.select(".deal-item")
         )
-
         if not products:
-            log.warning("  ⚠️ No products found on PlayStation deals page")
-            return games
+            log.warning("  ⚠️ No products found, trying fallback selectors")
+            products = soup.select("[class*='game'], [class*='offer'], [class*='deal']")
 
         for product in products:
             try:
                 title_el = (
                     product.select_one(".product-title") or
                     product.select_one("[data-testid='product-title']") or
-                    product.select_one("h3, h2, .title")
+                    product.select_one("h3, h2, .title") or
+                    product.select_one("[class*='title']")
                 )
                 if not title_el:
                     continue
@@ -970,7 +968,8 @@ def fetch_playstation_deals() -> list[dict]:
                 discount_el = (
                     product.select_one(".discount-badge") or
                     product.select_one("[data-testid='discount-badge']") or
-                    product.select_one(".discount-percentage")
+                    product.select_one(".discount-percentage") or
+                    product.select_one("[class*='discount']")
                 )
                 if not discount_el:
                     continue
@@ -978,18 +977,20 @@ def fetch_playstation_deals() -> list[dict]:
                 discount_text = discount_el.text.strip().replace("%", "").replace("-", "")
                 discount = int(discount_text) if discount_text.isdigit() else 0
 
-                if discount < 90:
+                if discount < MIN_DISCOUNT:
                     continue
 
                 price_orig_el = (
                     product.select_one(".price-display .original-price") or
                     product.select_one(".strike-through") or
-                    product.select_one(".price__old")
+                    product.select_one(".price__old") or
+                    product.select_one("[class*='original']")
                 )
                 price_final_el = (
                     product.select_one(".price-display .final-price") or
                     product.select_one(".price__current") or
-                    product.select_one(".price__new")
+                    product.select_one(".price__new") or
+                    product.select_one("[class*='final']")
                 )
 
                 orig = price_orig_el.text.strip() if price_orig_el else ""
@@ -1033,20 +1034,16 @@ def fetch_playstation_deals() -> list[dict]:
 
 def fetch_playstation_plus_essential() -> list[dict]:
     """بازی‌های ماهانه PS Plus Essential (۲‑۳ بازی)"""
-    if not should_check_monthly("playstation_essential"):
-        log.info("  ⏭️ PS Essential already checked today")
-        return []
-
     games = []
     url = "https://www.playstation.com/en-us/ps-plus/"
-
-    log.info(f"  🔍 Scraping PS Plus Essential from {url}")
     r = safe_get(url, use_scraper=True, retries=3, delay=3,
                  extra_headers={"Referer": "https://www.playstation.com/"})
-
     if not r:
-        log.error("  ❌ PS Plus page not accessible")
-        return games
+        # تلاش با URL جایگزین
+        r = safe_get("https://www.playstation.com/en-us/ps-plus/games/", use_scraper=True, retries=2)
+        if not r:
+            log.error("  ❌ PS Plus page not accessible")
+            return games
 
     try:
         soup = BeautifulSoup(r.text, "html.parser")
@@ -1054,29 +1051,31 @@ def fetch_playstation_plus_essential() -> list[dict]:
             soup.select_one("#ps-plus-essential") or
             soup.select_one(".ps-plus-essential") or
             soup.select_one("[data-testid='essential-section']") or
-            soup.select_one(".ps-plus-game-section")
+            soup.select_one(".ps-plus-game-section") or
+            soup.select_one("[class*='essential']")
         )
         if not essential_section:
-            log.warning("  ⚠️ Essential section not found, searching whole page")
             essential_section = soup
 
         game_cards = (
             essential_section.select(".game-card") or
             essential_section.select(".ps-plus-game-card") or
             essential_section.select(".card") or
-            essential_section.select(".game-tile")
+            essential_section.select(".game-tile") or
+            essential_section.select("[class*='game']") or
+            essential_section.select("li[data-game-id]")
         )
-
         if not game_cards:
-            log.warning("  ⚠️ No game cards found for Essential")
-            return games
+            log.warning("  ⚠️ No PS Essential games found, trying all game elements")
+            game_cards = soup.select("[class*='game-card'], [class*='game-tile'], [class*='game']")
 
         for card in game_cards[:5]:
             try:
                 title_el = (
                     card.select_one(".game-title") or
                     card.select_one("h3, h4") or
-                    card.select_one(".title")
+                    card.select_one(".title") or
+                    card.select_one("[class*='title']")
                 )
                 if not title_el:
                     continue
@@ -1116,20 +1115,15 @@ def fetch_playstation_plus_essential() -> list[dict]:
 
 def fetch_playstation_plus_extra() -> list[dict]:
     """بازی‌های جدید PS Plus Extra (فقط AAA)"""
-    if not should_check_monthly("playstation_extra"):
-        log.info("  ⏭️ PS Extra already checked today")
-        return []
-
     games = []
     url = "https://www.playstation.com/en-us/ps-plus/"
-
-    log.info(f"  🔍 Scraping PS Plus Extra from {url}")
     r = safe_get(url, use_scraper=True, retries=3, delay=3,
                  extra_headers={"Referer": "https://www.playstation.com/"})
-
     if not r:
-        log.error("  ❌ PS Plus page not accessible")
-        return games
+        r = safe_get("https://www.playstation.com/en-us/ps-plus/games/", use_scraper=True, retries=2)
+        if not r:
+            log.error("  ❌ PS Plus page not accessible")
+            return games
 
     try:
         soup = BeautifulSoup(r.text, "html.parser")
@@ -1137,29 +1131,31 @@ def fetch_playstation_plus_extra() -> list[dict]:
             soup.select_one("#ps-plus-extra") or
             soup.select_one(".ps-plus-extra") or
             soup.select_one("[data-testid='extra-section']") or
-            soup.select_one(".ps-plus-game-section")
+            soup.select_one(".ps-plus-game-section") or
+            soup.select_one("[class*='extra']")
         )
         if not extra_section:
-            log.warning("  ⚠️ Extra section not found, searching whole page")
             extra_section = soup
 
         game_cards = (
             extra_section.select(".game-card") or
             extra_section.select(".ps-plus-game-card") or
             extra_section.select(".card") or
-            extra_section.select(".game-tile")
+            extra_section.select(".game-tile") or
+            extra_section.select("[class*='game']") or
+            extra_section.select("li[data-game-id]")
         )
-
         if not game_cards:
-            log.warning("  ⚠️ No game cards found for Extra")
-            return games
+            log.warning("  ⚠️ No PS Extra games found, trying all game elements")
+            game_cards = soup.select("[class*='game-card'], [class*='game-tile'], [class*='game']")
 
         for card in game_cards[:10]:
             try:
                 title_el = (
                     card.select_one(".game-title") or
                     card.select_one("h3, h4") or
-                    card.select_one(".title")
+                    card.select_one(".title") or
+                    card.select_one("[class*='title']")
                 )
                 if not title_el:
                     continue
@@ -1167,17 +1163,18 @@ def fetch_playstation_plus_extra() -> list[dict]:
                 if not title or _should_skip(title):
                     continue
 
-                # چک کردن AAA بودن با RAWG
+                # تشخیص AAA (با آستانه ۷۰ یا لیست)
                 rawg = rawg_search(title)
                 is_aaa = False
                 if rawg:
                     metacritic = rawg.get("metacritic")
-                    if metacritic and metacritic >= 80:
+                    if metacritic and metacritic >= 70:
                         is_aaa = True
-                    elif rawg.get("rating_pct") and rawg.get("rating_pct") >= 80:
+                    elif rawg.get("rating_pct") and rawg.get("rating_pct") >= 70:
                         is_aaa = True
 
                 if not is_aaa:
+                    # لیست گسترده AAA معروف
                     aaa_titles = [
                         "god of war", "spider-man", "horizon", "uncharted",
                         "last of us", "final fantasy", "resident evil",
@@ -1185,10 +1182,18 @@ def fetch_playstation_plus_extra() -> list[dict]:
                         "call of duty", "battlefield", "assassin's creed",
                         "far cry", "ghost of tsushima", "death stranding",
                         "days gone", "demon's souls", "ratchet and clank",
-                        "returnal", "diablo", "overwatch"
+                        "returnal", "diablo", "overwatch", "starfield",
+                        "forza", "halo", "gears of war", "doom",
+                        "fallout", "elder scrolls", "minecraft", "age of empires",
+                        "stalker", "avowed", "fable", "perfect dark",
+                        "metal gear", "silent hill", "devil may cry", "monster hunter",
+                        "street fighter", "tekken", "mortal kombat", "crash bandicoot"
                     ]
                     if any(aaa in title.lower() for aaa in aaa_titles):
                         is_aaa = True
+
+                if not is_aaa and rawg and rawg.get("ratings_count", 0) > 1000:
+                    is_aaa = True
 
                 if not is_aaa:
                     log.debug(f"  ⏭️ Skipping non-AAA: {title}")
@@ -1255,27 +1260,24 @@ def playstation_get_promo_info(game: dict) -> tuple[str, str]:
 # ═══════════════════════════════════════════════════
 def fetch_xbox_gamepass() -> list[dict]:
     """بازی‌های جدید اضافه‌شده به Game Pass (فقط AAA)"""
-    if not should_check_monthly("xbox_gamepass"):
-        log.info("  ⏭️ Xbox Game Pass already checked today")
-        return []
-
     games = []
     url = "https://www.xbox.com/en-US/xbox-game-pass/games"
-
-    log.info(f"  🔍 Scraping Xbox Game Pass from {url}")
     r = safe_get(url, use_scraper=True, retries=3, delay=3,
                  extra_headers={"Referer": "https://www.xbox.com/"})
-
     if not r:
-        log.error("  ❌ Xbox Game Pass page not accessible")
-        return games
+        r = safe_get("https://www.xbox.com/en-US/games/xbox-game-pass", use_scraper=True, retries=2)
+        if not r:
+            log.error("  ❌ Xbox Game Pass page not accessible")
+            return games
 
     try:
         soup = BeautifulSoup(r.text, "html.parser")
         new_section = (
             soup.select_one(".recently-added") or
             soup.select_one(".new-games") or
-            soup.select_one("[data-testid='recently-added']")
+            soup.select_one("[data-testid='recently-added']") or
+            soup.select_one("[class*='new']") or
+            soup.select_one("[class*='recent']")
         )
         if not new_section:
             new_section = soup
@@ -1283,26 +1285,31 @@ def fetch_xbox_gamepass() -> list[dict]:
         game_cards = (
             new_section.select(".game-card") or
             new_section.select(".game-tile") or
-            new_section.select(".card")
+            new_section.select(".card") or
+            new_section.select("[class*='game']") or
+            new_section.select("li[data-game-id]")
         )
+        if not game_cards:
+            log.warning("  ⚠️ No Xbox Game Pass games found, trying all game elements")
+            game_cards = soup.select("[class*='game-card'], [class*='game-tile'], [class*='game']")
 
-        for card in game_cards[:10]:
+        for card in game_cards[:15]:
             try:
-                title_el = card.select_one(".game-title, h3, h4")
+                title_el = card.select_one(".game-title, h3, h4, [class*='title']")
                 if not title_el:
                     continue
                 title = title_el.text.strip()
                 if not title or _should_skip(title):
                     continue
 
-                # فیلتر AAA با RAWG
+                # تشخیص AAA
                 rawg = rawg_search(title)
                 is_aaa = False
                 if rawg:
                     metacritic = rawg.get("metacritic")
-                    if metacritic and metacritic >= 80:
+                    if metacritic and metacritic >= 70:
                         is_aaa = True
-                    elif rawg.get("rating_pct") and rawg.get("rating_pct") >= 80:
+                    elif rawg.get("rating_pct") and rawg.get("rating_pct") >= 70:
                         is_aaa = True
 
                 if not is_aaa:
@@ -1310,12 +1317,19 @@ def fetch_xbox_gamepass() -> list[dict]:
                         "starfield", "forza", "halo", "gears of war",
                         "call of duty", "diablo", "overwatch", "doom",
                         "fallout", "elder scrolls", "minecraft", "age of empires",
-                        "stalker", "avowed", "fable", "perfect dark"
+                        "stalker", "avowed", "fable", "perfect dark",
+                        "cyberpunk", "witcher", "red dead", "gta",
+                        "assassin's creed", "far cry", "resident evil",
+                        "final fantasy", "monster hunter", "devil may cry"
                     ]
                     if any(aaa in title.lower() for aaa in aaa_titles):
                         is_aaa = True
 
+                if not is_aaa and rawg and rawg.get("ratings_count", 0) > 1000:
+                    is_aaa = True
+
                 if not is_aaa:
+                    log.debug(f"  ⏭️ Skipping non-AAA: {title}")
                     continue
 
                 link_el = card.select_one("a[href]")
@@ -1325,6 +1339,8 @@ def fetch_xbox_gamepass() -> list[dict]:
 
                 img_el = card.select_one("img")
                 image = img_el.get("src", "") if img_el else ""
+                if image and image.startswith("//"):
+                    image = "https:" + image
 
                 game_id = title.lower().replace(" ", "-")
 
@@ -1465,6 +1481,8 @@ def build_caption(game: dict, end_date: str) -> str:
         tags.append("#FreeToKeep")
     elif discount == 100:
         tags.append("#FreeGames")
+    if discount >= 75:
+        tags.append("#BigDeal")    # تغییر برای تخفیف بالای ۷۵
     if discount >= 90:
         tags.append("#MegaDeal")
     hashtags = " ".join(tags)
@@ -1580,6 +1598,10 @@ def process_game(game: dict) -> tuple[str, str]:
     title  = game["title"]
     is_ftk = game.get("is_free_to_keep", False)
 
+    # ── چک کش ۲۴ ساعته (قبل از هر چیزی) ──
+    if is_recently_sent_cached(store, gid):
+        return "skipped", "sent within last 24 hours (cache)"
+
     # ── Steam ──────────────────────────────────────────────────
     if store == "steam":
         details = steam_get_details(gid)
@@ -1642,7 +1664,7 @@ def process_game(game: dict) -> tuple[str, str]:
     # ── PlayStation Plus Extra ──────────────────────────────
     elif store == "playstation_extra":
         enrich_from_steam(game)
-        if is_recently_sent(store, gid, days=365):
+        if is_recently_sent_db(store, gid, days=365):
             return "skipped", "sent within last year"
         end_display = "Included in Extra"
         period_anchor = f"EXTRA:{datetime.datetime.utcnow().strftime('%Y-%m')}"
@@ -1650,7 +1672,7 @@ def process_game(game: dict) -> tuple[str, str]:
     # ── Xbox Game Pass ──────────────────────────────────────
     elif store == "xbox_gamepass":
         enrich_from_steam(game)
-        if is_recently_sent(store, gid, days=365):
+        if is_recently_sent_db(store, gid, days=365):
             return "skipped", "sent within last year"
         end_display = "Included in Game Pass"
         period_anchor = f"GAMEPASS:{datetime.datetime.utcnow().strftime('%Y-%m')}"
@@ -1659,7 +1681,6 @@ def process_game(game: dict) -> tuple[str, str]:
         return "failed", f"unknown store {store}"
 
     # ── Dedup با deal_hash ──────────────────────────────────
-    # اگر deal_hash از قبل در game ذخیره نشده، از ترکیب start/end/price بساز
     deal_hash = game.get("deal_hash", "")
     if not deal_hash:
         deal_hash = get_deal_hash(game)
@@ -1678,6 +1699,7 @@ def process_game(game: dict) -> tuple[str, str]:
 
     if ok:
         mark_sent(store, gid, title, deal_hash)
+        mark_sent_cached(store, gid)  # ثبت در کش ۲۴ ساعته
         return "sent", ""
     else:
         return "failed", "telegram send error"
