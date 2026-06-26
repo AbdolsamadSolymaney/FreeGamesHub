@@ -1,12 +1,13 @@
 """
-FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox Game Pass
+FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-نسخه نهایی با اصلاحات:
-- AI با endpoint صحیح GitHub Models
-- GOG با اسکرپینگ + API
-- PlayStation با Smart Selector + fallback
-- تاریخ شمسی با پشتیبانی از فرمت‌های مختلف
-- افزایش پایداری و retry
+نسخه نهایی با تمام اصلاحات:
+- AI با آدرس جدید GitHub Models (models.inference.github.com)
+- GOG با اسکرپینگ بهبودیافته و API
+- تاریخ شمسی با jdatetime با چک فعال بودن
+- رفع خطاهای تصویر و بهبود پایداری
+- ارسال چرخشی PC → PS → Xbox
+- اجرای خودکار هر ۱۲ ساعت
 """
 
 import os
@@ -23,7 +24,7 @@ from bs4 import BeautifulSoup
 import cloudscraper
 import feedparser
 
-# تلاش برای import jdatetime
+# ─── jdatetime ──────────────────────────────────────────────────────────
 try:
     import jdatetime
     JDT_AVAILABLE = True
@@ -43,6 +44,7 @@ log = logging.getLogger(__name__)
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
 RAWG_API_KEY = os.environ.get("RAWG_API_KEY", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 DB_FILE      = "games.db"
 SELECTORS_DB = "selectors_cache.json"
 MIN_DISCOUNT = 75
@@ -193,7 +195,7 @@ def is_recently_sent_db(store: str, game_id: str, days: int = 365) -> bool:
     except:
         return False
 
-# ─── HTTP Helper (با افزایش Retry) ────────────────────────────────────
+# ─── HTTP Helper ─────────────────────────────────────────────────────────
 def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_headers=None):
     headers = dict(HEADERS)
     if extra_headers:
@@ -217,10 +219,10 @@ def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_head
     log.error(f"All {retries} attempts failed for {url}")
     return None
 
-# ─── AI Decision Engine (با endpoint صحیح) ────────────────────────────
+# ─── AI Decision Engine ─────────────────────────────────────────────────
 class AIDecisionEngine:
     def __init__(self):
-        self.token = os.environ.get("GITHUB_TOKEN", "")
+        self.token = GITHUB_TOKEN
         self.enabled = bool(self.token)
         self.consensus_count = 3
         self.confidence_threshold = 80
@@ -269,10 +271,11 @@ class AIDecisionEngine:
 
     def _call_ai(self, game: dict) -> Optional[dict]:
         prompt = self._build_prompt(game)
+        # آدرس جدید GitHub Models
+        url = "https://models.inference.github.com/chat/completions"
         try:
-            # استفاده از endpoint صحیح GitHub Models (بدون /v1)
             response = requests.post(
-                "https://models.github.com/chat/completions",
+                url,
                 headers={
                     "Authorization": f"Bearer {self.token}",
                     "Content-Type": "application/json",
@@ -287,7 +290,7 @@ class AIDecisionEngine:
                     "temperature": 0.0,
                     "max_tokens": 500
                 },
-                timeout=15
+                timeout=20
             )
             if response.status_code != 200:
                 log.warning(f"AI API error: {response.status_code}")
@@ -306,7 +309,7 @@ class AIDecisionEngine:
         return f"""
 You are an expert game deal validator AI. Your ONLY job is to analyze game deal data and decide if it's VALID and should be sent to users.
 
-=== DATA ===
+DATA:
 Title: {game.get('title', 'Unknown')}
 Store: {game.get('store', 'Unknown')}
 Discount: {game.get('discount', 0)}%
@@ -319,26 +322,17 @@ End: {game.get('deal_end', 'N/A')}
 Genres: {game.get('genres', [])}
 Metacritic: {game.get('metacritic', 'N/A')}
 
-=== RULES (REJECT IF ANY) ===
-- Title contains DLC, Soundtrack, OST, Season Pass, Upgrade, Add-on, Deluxe, Bundle, Cosmetic
-- Discount 100% but NOT Free to Keep
-- Inconsistent prices (original=final but discount>0)
-- Start > End
-- Link invalid
-- Title corrupted (special chars)
+RULES:
+- REJECT if title contains: DLC, Soundtrack, OST, Season Pass, Upgrade, Add-on, Deluxe, Bundle, Cosmetic
+- REJECT if 100% discount but NOT Free to Keep
+- REJECT if inconsistent prices (original=final but discount>0)
+- REJECT if Start > End
+- REJECT if link invalid
+- ACCEPT if 100% + Free to Keep → ACCEPT
+- ACCEPT if Metacritic ≥ 90
 
-=== SPECIAL ===
-- 100% + Free to Keep → ACCEPT
-- Metacritic ≥ 90 → prioritize ACCEPT
-
-=== RESPOND JSON ===
-{{
-  "decision": "accept" or "reject",
-  "confidence": 0-100,
-  "reason": "short explanation",
-  "warnings": [],
-  "corrected_data": {{}}
-}}
+RESPOND JSON ONLY:
+{{"decision": "accept" or "reject", "confidence": 0-100, "reason": "short explanation", "warnings": [], "corrected_data": {{}}}}
 """
 
     def _analyze_consensus(self, results: list, game: dict) -> Tuple[bool, str, dict]:
@@ -385,11 +379,11 @@ Metacritic: {game.get('metacritic', 'N/A')}
         conn.commit()
         conn.close()
 
-# ─── Date Formatter (با پشتیبانی از فرمت‌های مختلف) ──────────────────
+# ─── Date Formatter ────────────────────────────────────────────────────
 def format_date_persian_english(date_str: str) -> str:
-    if not date_str:
+    if not date_str or not date_str.strip():
         return "نامشخص"
-    date_str_clean = date_str.split("T")[0].split(" ")[0]
+    date_str_clean = date_str.split("T")[0].split(" ")[0].strip()
     formats = ["%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%b %d, %Y", "%d/%m/%Y", "%m/%d/%Y"]
     dt = None
     for fmt in formats:
@@ -399,16 +393,32 @@ def format_date_persian_english(date_str: str) -> str:
         except ValueError:
             continue
     if dt is None:
-        return date_str
+        return date_str_clean
     gregorian = dt.strftime("%d %b %Y")
     if JDT_AVAILABLE and jdatetime:
         try:
             jd = jdatetime.datetime.fromgregorian(datetime=dt)
             persian = jd.strftime("%Y/%m/%d")
             return f"{persian}\n{gregorian}"
-        except:
+        except Exception as e:
+            log.warning(f"jdatetime conversion failed: {e}")
             return gregorian
-    return gregorian
+    else:
+        return gregorian
+
+# ─── Check jdatetime ──────────────────────────────────────────────────
+def check_jdatetime():
+    if JDT_AVAILABLE:
+        try:
+            today = jdatetime.datetime.now()
+            log.info(f"✅ jdatetime فعال است | امروز شمسی: {today.strftime('%Y/%m/%d')}")
+            return True
+        except Exception as e:
+            log.error(f"❌ jdatetime نصب است اما خطا در اجرا: {e}")
+            return False
+    else:
+        log.error("❌ jdatetime نصب نشده! تاریخ شمسی نمایش داده نمی‌شود.")
+        return False
 
 # ─── RAWG API ────────────────────────────────────────────────────────────
 _rawg_cache: dict = {}
@@ -543,7 +553,9 @@ def get_image_candidates(game: dict) -> list[str]:
         img = re.sub(r'/\d+x\d+/', '/original/', img)
         candidates.append(img)
         candidates.append(game["image_url"])
-    return candidates
+    # فیلتر تصاویر با پسوند معتبر
+    valid_ext = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
+    return [c for c in candidates if c and any(c.lower().endswith(ext) for ext in valid_ext)]
 
 # ─── Priority Score ────────────────────────────────────────────────────
 def calculate_priority_score(game: dict) -> int:
@@ -945,7 +957,7 @@ def epic_get_promo_info(game: dict) -> tuple[str, str, str]:
         pass
     return "", "", f"FTK:{current_week_anchor()}"
 
-# ─── GOG (API + اسکرپینگ) ─────────────────────────────────────────────
+# ─── GOG (API + اسکرپینگ بهبودیافته) ──────────────────────────────
 def fetch_gog_games() -> list[dict]:
     games = []
     log.info("  🔍 Fetching GOG via API (official)")
@@ -953,8 +965,8 @@ def fetch_gog_games() -> list[dict]:
     _merge(games, api_games)
     log.info(f"  GOG API: {len(api_games)} games")
     if len(games) < 5:
-        log.info("  🔍 Fetching GOG via Scraping")
-        scrape_games = _gog_fetch_scrape()
+        log.info("  🔍 Fetching GOG via Scraping (improved)")
+        scrape_games = _gog_fetch_scrape_improved()
         before = len(games)
         _merge(games, scrape_games)
         log.info(f"  GOG Scrape: {len(scrape_games)} raw → {len(games)-before} new")
@@ -972,9 +984,9 @@ def _gog_fetch_api() -> list[dict]:
         "page": 1,
         "countryCode": "US",
         "currencyCode": "USD",
-        "price": "0,1000"
     }
-    r = safe_get(url, params=params, use_scraper=True, retries=3, extra_headers={"Referer": "https://www.gog.com/", "Accept": "application/json"})
+    r = safe_get(url, params=params, use_scraper=True, retries=3,
+                 extra_headers={"Referer": "https://www.gog.com/", "Accept": "application/json"})
     if not r:
         log.warning("  ⚠️ GOG API failed")
         return games
@@ -986,9 +998,7 @@ def _gog_fetch_api() -> list[dict]:
             title = item.get("title", "").strip()
             if not title:
                 continue
-            price_info = item.get("price", {})
-            if not price_info:
-                continue
+            price_info = item.get("price", {}) or {}
             discount = int(price_info.get("discountPercentage", 0) or 0)
             if discount < MIN_DISCOUNT and discount != 100:
                 continue
@@ -997,18 +1007,19 @@ def _gog_fetch_api() -> list[dict]:
             orig_fmt = f"${float(base_price):.2f}" if base_price else ""
             final_fmt = f"${float(final_price):.2f}" if final_price else ("FREE" if discount == 100 else "")
             slug = item.get("slug", "")
-            link = f"https://www.gog.com/en/game/{slug}" if slug else "https://www.gog.com"
+            link = f"https://www.gog.com/en/game/{slug}" if slug else ""
             cover = item.get("coverHorizontal", "") or item.get("cover", "")
-            game_id = str(item.get("id", slug or title))
+            game_id = str(item.get("id", slug))
             is_ftk = (discount == 100 and final_price == 0)
-            game = make_game("gog", game_id, title, discount, link, orig_fmt, final_fmt, image_url=cover, is_free_to_keep=is_ftk)
+            game = make_game("gog", game_id, title, discount, link, orig_fmt, final_fmt,
+                           image_url=cover, is_free_to_keep=is_ftk)
             games.append(game)
             log.info(f"  🟣 GOG API: {title} -{discount}%")
     except Exception as e:
-        log.warning(f"  ⚠️ GOG API parse error: {e}")
+        log.error(f"GOG API parse error: {e}")
     return games
 
-def _gog_fetch_scrape() -> list[dict]:
+def _gog_fetch_scrape_improved() -> list[dict]:
     games = []
     urls = [
         "https://www.gog.com/en/games?discounted=true&page=1",
@@ -1023,7 +1034,6 @@ def _gog_fetch_scrape() -> list[dict]:
         log.warning("  ⚠️ GOG scrape failed")
         return games
     soup = BeautifulSoup(r.text, "html.parser")
-    # سلکتورهای جدید
     products = soup.select("[data-testid='productCard']") or soup.select(".product-tile") or soup.select(".product-card")
     if not products:
         products = soup.select("a[href*='/en/game/']")
@@ -1036,7 +1046,7 @@ def _gog_fetch_scrape() -> list[dict]:
             title = title_el.get_text(strip=True)
             if not title or _should_skip(title):
                 continue
-            discount_el = prod.select_one("[data-testid='discountPercentage']") or prod.select_one(".discount-percentage")
+            discount_el = prod.select_one("[data-testid='discountPercentage']") or prod.select_one(".discount-percentage") or prod.select_one(".discount")
             discount = 0
             if discount_el:
                 disc_text = discount_el.get_text(strip=True).replace("%", "").replace("-", "")
@@ -1095,7 +1105,7 @@ def gog_get_promo_info(game: dict) -> tuple[str, str, str]:
     prefix = "FTK:" if game.get("is_free_to_keep") else ""
     return start, end, f"{prefix}{week}"
 
-# ─── PlayStation (Smart Selector + fallback) ──────────────────────────
+# ─── PlayStation (Smart Selector) ──────────────────────────────────
 class SmartSelector:
     def __init__(self, soup: BeautifulSoup, store: str, page_type: str):
         self.soup = soup
@@ -1165,7 +1175,7 @@ class SmartSelector:
         return el.get(attr, default) if el else default
 
     def find_element(self, target: str, parent=None):
-        return None  # not used in PlayStation fetch
+        return None
 
 def fetch_playstation_deals() -> list[dict]:
     games = []
@@ -1223,43 +1233,6 @@ def fetch_playstation_deals() -> list[dict]:
             log.info(f"  🎮 PS Deal: {title} -{discount}%")
         except:
             continue
-    # اگر هیچی پیدا نشد، fallback به psdeals.net
-    if not games:
-        log.info("  🔍 Fallback to psdeals.net")
-        r2 = safe_get("https://psdeals.net/us-store/deals", use_scraper=True, retries=3)
-        if r2:
-            soup2 = BeautifulSoup(r2.text, "html.parser")
-            for item in soup2.select(".game-item, .deal-item"):
-                try:
-                    title_el = item.select_one(".title, .name")
-                    if not title_el:
-                        continue
-                    title = title_el.get_text(strip=True)
-                    if not title or _should_skip(title):
-                        continue
-                    disc_el = item.select_one(".discount, .price-off")
-                    discount = 0
-                    if disc_el:
-                        disc_text = disc_el.get_text(strip=True)
-                        match = re.search(r'(\d+)%', disc_text)
-                        if match:
-                            discount = int(match.group(1))
-                    if discount < MIN_DISCOUNT:
-                        continue
-                    link_el = item.select_one("a[href]")
-                    link = link_el.get("href", "") if link_el else ""
-                    if link and not link.startswith("http"):
-                        link = "https://psdeals.net" + link
-                    img_el = item.select_one("img")
-                    image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
-                    if image_url and image_url.startswith("//"):
-                        image_url = "https:" + image_url
-                    game_id = title.lower().replace(" ", "-").replace(":", "")
-                    game = make_game("playstation", game_id, title, discount, link, "", "", image_url)
-                    games.append(game)
-                    log.info(f"  🎮 PS Deal (fallback): {title} -{discount}%")
-                except:
-                    continue
     log.info(f"  ✅ PlayStation deals: {len(games)} games found")
     return games
 
@@ -1336,7 +1309,7 @@ def fetch_playstation_plus_essential() -> list[dict]:
     try:
         feed = feedparser.parse("https://blog.playstation.com/feed/")
         for entry in feed.entries[:30]:
-            if "PlayStation Plus" not in entry.title and "PS Plus" not in entry.title:
+            if "PlayStation Plus" not in title and "PS Plus" not in title:
                 continue
             content = entry.content[0].value if hasattr(entry, 'content') else entry.description
             full = entry.title + " " + content
@@ -1381,7 +1354,7 @@ def fetch_playstation_plus_extra() -> list[dict]:
     try:
         feed = feedparser.parse("https://blog.playstation.com/feed/")
         for entry in feed.entries[:30]:
-            if "PS Plus Extra" not in entry.title and "PlayStation Plus Extra" not in entry.title:
+            if "PS Plus Extra" not in title and "PlayStation Plus Extra" not in title:
                 continue
             content = entry.content[0].value if hasattr(entry, 'content') else entry.description
             full = entry.title + " " + content
@@ -1798,8 +1771,7 @@ def main():
 
     if not RAWG_API_KEY:
         log.warning("⚠️  RAWG_API_KEY not set — some stores may lack genre/description")
-    if not JDT_AVAILABLE:
-        log.warning("⚠️  jdatetime not installed — Persian dates will not be shown. Install with: pip install jdatetime")
+    check_jdatetime()
 
     AI_ENGINE = AIDecisionEngine()
     init_db()
@@ -1836,7 +1808,6 @@ def main():
 
     log.info(f"Total unique deals before filtering: {len(all_games)}")
 
-    # فیلتر Free to Play
     filtered = []
     for g in all_games:
         if g.get("is_free_to_play", False) and not g.get("is_free_to_keep", False):
@@ -1854,7 +1825,6 @@ def main():
     for g in all_games:
         calculate_priority_score(g)
 
-    # گروه‌بندی
     pc_stores = ["steam", "epic", "gog"]
     ps_stores = ["playstation", "playstation_essential", "playstation_extra"]
     xbox_stores = ["xbox_gamepass"]
