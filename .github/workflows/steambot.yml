@@ -1,9 +1,14 @@
 name: FreeGamesHub
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # اجرای دستی از دکمه
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 */12 * * *"   # هر ۱۲ ساعت یکبار (ساعت ۰۰ و ۱۲)
+
+# دسترسی‌های لازم برای GitHub Models
+permissions:
+  contents: read
+  models: read                # این خط برای AI بسیار مهم است
 
 jobs:
   run-bot:
@@ -27,5 +32,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # این خط اضافه شد
         run: |
           python main.py
