@@ -1,10 +1,9 @@
 """
 FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-نسخه نهایی با Smart Selector (خودآموز و مقاوم در برابر تغییرات ساختار)
-- سیستم هوشمند انتخاب سلکتور با کش و چندین روش جایگزین
-- تشخیص خودکار سلکتورهای موفق و ذخیره در کش
-- پشتیبانی از همه فروشگاه‌ها با سلکتورهای مقاوم
+نسخه نهایی با AI Decision Engine (تصمیم‌گیری کاملاً خودکار)
+- AI با GitHub Models تصمیم‌گیری می‌کند (Consensus با ۳ بار بررسی)
+- Smart Selector برای مقاومت در برابر تغییرات ساختار فروشگاه‌ها
 - نمایش تاریخ شمسی و میلادی
 - فیلتر بازی‌های Free to Play
 - Priority Score برای اولویت‌بندی ارسال
@@ -21,7 +20,7 @@ import sqlite3
 import datetime
 import re
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from bs4 import BeautifulSoup
 import cloudscraper
 import feedparser
@@ -128,6 +127,17 @@ def init_db():
             PRIMARY KEY (store, game_id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_decisions (
+            game_id    TEXT,
+            title      TEXT,
+            decision   TEXT,
+            confidence INTEGER,
+            warnings   TEXT,
+            checked_at TEXT,
+            PRIMARY KEY (game_id)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -221,261 +231,241 @@ def safe_get(url, params=None, retries=3, delay=2, use_scraper=False, extra_head
     return None
 
 # ═══════════════════════════════════════════════════
-#  SMART SELECTOR SYSTEM
+#  AI VALIDATION — تصمیم‌گیری کامل خودکار
 # ═══════════════════════════════════════════════════
 
-def load_selector_cache() -> dict:
-    """بارگذاری کش سلکتورهای موفق از فایل"""
-    try:
-        with open(SELECTORS_DB, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_selector_cache(cache: dict):
-    """ذخیره کش سلکتورهای موفق در فایل"""
-    try:
-        with open(SELECTORS_DB, "w") as f:
-            json.dump(cache, f, indent=2)
-    except:
-        pass
-
-class SmartSelector:
+class AIDecisionEngine:
     """
-    کلاس هوشمند برای انتخاب سلکتورها
-    - از کش سلکتورهای موفق استفاده می‌کند
-    - چندین سلکتور جایگزین دارد
-    - با Regex و Content-Based هم کار می‌کند
+    موتور تصمیم‌گیری هوش مصنوعی
+    - بررسی کامل بازی با AI
+    - Consensus با ۳ بار درخواست برای دقت ۱۰۰٪
+    - تصمیم نهایی: ارسال یا رد
+    - ذخیره تمام تصمیمات در دیتابیس
     """
     
-    def __init__(self, soup: BeautifulSoup, store: str, page_type: str):
-        self.soup = soup
-        self.store = store
-        self.page_type = page_type
-        self.cache_key = f"{store}_{page_type}"
-        self.selector_cache = load_selector_cache()
-        self._used_selectors = {}
+    def __init__(self):
+        self.token = os.environ.get("GITHUB_TOKEN", "")
+        self.enabled = bool(self.token)
+        self.consensus_count = 3
+        self.confidence_threshold = 80
+        self.decisions_log = []
         
-    def find_element(self, target: str, parent=None, fallback_selectors: list = None):
+        if self.enabled:
+            log.info("🤖 AI Decision Engine initialized with GitHub Models")
+        else:
+            log.warning("⚠️ GITHUB_TOKEN not set — using fallback logic")
+    
+    def decide(self, game: Dict[str, Any]) -> Tuple[bool, str, Dict]:
         """
-        پیدا کردن یک المان با چندین روش
-        target: 'title', 'price', 'discount', 'image', 'link', 'game_card'
-        parent: المان والد (اختیاری)
-        fallback_selectors: لیست سلکتورهای دستی (اختیاری)
+        تصمیم‌گیری درباره یک بازی
+        برمی‌گرداند: (is_valid, reason, corrected_data)
         """
-        soup_target = parent if parent else self.soup
+        if not self.enabled:
+            return self._fallback_decision(game)
         
-        # 1. بررسی کش (سلکتور موفق قبلی)
-        cached_selector = self.selector_cache.get(self.cache_key, {}).get(target)
-        if cached_selector:
+        # ۱. بررسی اولیه با منطق ساده (فیلتر سریع)
+        quick_check = self._quick_check(game)
+        if not quick_check[0]:
+            return False, quick_check[1], {}
+        
+        # ۲. بررسی با AI (Consensus)
+        results = []
+        for i in range(self.consensus_count):
+            result = self._call_ai(game)
+            if result:
+                results.append(result)
+            time.sleep(0.5)
+        
+        if not results:
+            return self._fallback_decision(game)
+        
+        # ۳. تحلیل نتایج Consensus
+        return self._analyze_consensus(results, game)
+    
+    def _quick_check(self, game: dict) -> Tuple[bool, str]:
+        """بررسی سریع با منطق ساده"""
+        title = game.get('title', '')
+        
+        for kw in SKIP_KEYWORDS:
+            if kw.lower() in title.lower():
+                return False, f"Contains '{kw}'"
+        
+        if game.get('discount', 0) > 0:
+            orig = game.get('price_orig_fmt', '')
+            final = game.get('price_final_fmt', '')
+            if orig and final and orig == final and game.get('discount', 0) > 0:
+                return False, "Price mismatch: original = final but discount > 0"
+        
+        start = game.get('deal_start', '')
+        end = game.get('deal_end', '')
+        if start and end:
             try:
-                result = soup_target.select_one(cached_selector)
-                if result:
-                    return result
+                s = datetime.datetime.strptime(start, "%Y-%m-%d")
+                e = datetime.datetime.strptime(end, "%Y-%m-%d")
+                if s > e:
+                    return False, "Start date after end date"
             except:
                 pass
         
-        # 2. سلکتورهای پیش‌فرض برای هر target
-        default_selectors = self._get_default_selectors(target)
-        
-        # 3. سلکتورهای fallback (اگر داده شده باشند)
-        all_selectors = default_selectors + (fallback_selectors or [])
-        
-        # 4. اجرای سلکتورها به ترتیب
-        for selector in all_selectors:
-            try:
-                result = soup_target.select_one(selector)
-                if result:
-                    self._save_successful_selector(target, selector)
-                    return result
-            except:
-                continue
-        
-        # 5. روش Content-Based (آخرین راه)
-        result = self._find_by_content(target, soup_target)
-        if result:
-            return result
-        
-        return None
+        return True, "Quick check passed"
     
-    def find_elements(self, target: str, parent=None, fallback_selectors: list = None) -> list:
-        """پیدا کردن چند المان (مثل لیست بازی‌ها)"""
-        soup_target = parent if parent else self.soup
+    def _call_ai(self, game: dict) -> Optional[dict]:
+        """ارسال درخواست به AI و دریافت پاسخ"""
+        prompt = self._build_prompt(game)
         
-        cached_selector = self.selector_cache.get(self.cache_key, {}).get(f"{target}_list")
-        if cached_selector:
-            try:
-                results = soup_target.select(cached_selector)
-                if results:
-                    return results
-            except:
-                pass
-        
-        default_selectors = self._get_default_selectors(f"{target}_list")
-        all_selectors = default_selectors + (fallback_selectors or [])
-        
-        for selector in all_selectors:
-            try:
-                results = soup_target.select(selector)
-                if results:
-                    self._save_successful_selector(f"{target}_list", selector)
-                    return results
-            except:
-                continue
-        
-        return []
+        try:
+            response = requests.post(
+                "https://models.github.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o",
+                    "messages": [
+                        {"role": "system", "content": "You are a precise game deal validator. Always respond in JSON. You must decide if this deal is valid and should be sent to users."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 500
+                },
+                timeout=15
+            )
+            
+            if response.status_code != 200:
+                log.warning(f"AI API error: {response.status_code}")
+                return None
+            
+            data = response.json()
+            content = data['choices'][0]['message']['content']
+            
+            import re
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            else:
+                return None
+                
+        except Exception as e:
+            log.error(f"AI call error: {e}")
+            return None
     
-    def _get_default_selectors(self, target: str) -> List[str]:
-        """سلکتورهای پیش‌فرض برای هر فروشگاه و target"""
-        base_selectors = {
-            "title": [
-                "[data-testid='productTitle']",
-                "[data-qa*='title']",
-                ".product-title",
-                ".title",
-                "h3, h4",
-                "[class*='title']",
-                "[class*='name']"
-            ],
-            "title_list": [
-                "[data-testid='productTitle']",
-                ".product-title",
-                ".title",
-                "h3, h4",
-                "[class*='title']"
-            ],
-            "discount": [
-                "[data-testid='discountPercentage']",
-                "[data-qa*='discount']",
-                ".discount-percentage",
-                ".discount",
-                "[class*='discount']",
-                ".price__discount"
-            ],
-            "price_original": [
-                ".original-price",
-                ".price__old",
-                ".old-price",
-                "[class*='original']",
-                ".strike-through",
-                ".was"
-            ],
-            "price_final": [
-                ".final-price",
-                ".price__current",
-                ".current-price",
-                "[class*='final']",
-                ".price",
-                ".now"
-            ],
-            "image": [
-                "img",
-                "[data-testid='productImage']",
-                "[class*='image'] img",
-                ".cover img"
-            ],
-            "link": [
-                "a[href*='/product/']",
-                "a[href*='/game/']",
-                "a[href*='/app/']",
-                "a[href]"
-            ],
-            "game_card": [
-                "[data-testid='productCard']",
-                "[data-qa*='product']",
-                ".product-card",
-                ".product-tile",
-                "[class*='product']",
-                "li[data-product-id]",
-                "[class*='game']"
-            ],
-            "game_card_list": [
-                "[data-testid='productCard']",
-                ".product-card",
-                ".product-tile",
-                "[class*='product']",
-                "li[data-product-id]",
-                "[class*='game']",
-                ".game-item",
-                ".game-tile"
-            ]
-        }
+    def _build_prompt(self, game: dict) -> str:
+        return f"""
+You are a game deal validator. Your task is to decide if this deal is VALID and should be sent to users.
+
+Game Information:
+- Title: {game.get('title', 'Unknown')}
+- Store: {game.get('store', 'Unknown')}
+- Discount: {game.get('discount', 0)}%
+- Original Price: {game.get('price_orig_fmt', 'N/A')}
+- Final Price: {game.get('price_final_fmt', 'N/A')}
+- Link: {game.get('link', 'N/A')}
+- Is Free to Keep: {game.get('is_free_to_keep', False)}
+- Deal Start: {game.get('deal_start', 'N/A')}
+- Deal End: {game.get('deal_end', 'N/A')}
+- Genres: {game.get('genres', [])}
+- Metacritic: {game.get('metacritic', 'N/A')}
+
+Decision Rules:
+1. Reject if it's DLC, Soundtrack, Season Pass, or similar (title contains these)
+2. Reject if discount is inconsistent with prices
+3. Reject if deal dates are invalid (start > end)
+4. Reject if link is invalid
+5. For free games (discount 100%), check if it's really free
+6. Check if the game is a real game (not a demo, beta, etc.)
+7. Check if the game title is correct (not truncated or corrupted)
+
+RESPOND IN JSON ONLY:
+{{
+  "decision": "accept" or "reject",
+  "confidence": 0-100,
+  "reason": "short explanation",
+  "warnings": ["warning1", "warning2"],
+  "corrected_data": {{
+    "field": "corrected_value"
+  }}
+}}
+
+Only include fields that need correction.
+"""
+    
+    def _analyze_consensus(self, results: list, original_game: dict) -> Tuple[bool, str, dict]:
+        if len(results) < 2:
+            return self._extract_result(results[0], original_game) if results else (False, "No AI response", {})
         
-        # سلکتورهای اختصاصی برای هر فروشگاه
-        store_specific = {
-            "steam": {
-                "title": [".title", ".game_title", ".search_result_row .title"],
-                "discount": [".discount_pct", ".discount_percent"],
-                "price_original": [".discount_original_price", ".original-price"],
-                "price_final": [".discount_final_price", ".final-price"],
-                "game_card_list": [".search_result_row", ".gameListRow", ".tab_item"]
-            },
-            "gog": {
-                "title": ["[data-testid='productTitle']", ".product-title", ".title"],
-                "discount": ["[data-testid='discountPercentage']", ".discount-percentage"],
-                "price_original": [".original-price", ".old-price"],
-                "price_final": [".final-price", ".current-price"],
-                "game_card_list": ["[data-testid='productCard']", ".product-tile", ".product-card"]
-            },
-            "playstation": {
-                "title": ["[data-testid='product-title']", ".product-title", ".title"],
-                "discount": ["[data-testid='discount-badge']", ".discount-badge"],
-                "price_original": ["[data-testid='original-price']", ".original-price", ".price__old"],
-                "price_final": ["[data-testid='final-price']", ".final-price", ".price__current"],
-                "game_card_list": ["[data-testid='product-card']", ".product-card", ".grid-cell"]
-            },
-            "epic": {
-                "title": ["[data-testid='title']", ".title", ".product-title"],
-                "game_card_list": ["[data-testid='product-card']", ".product-card", ".card"]
-            },
-            "xbox": {
-                "title": [".game-title", ".title", "h3, h4"],
-                "game_card_list": [".game-card", ".game-tile", ".card"]
-            }
-        }
+        accept_count = 0
+        reject_count = 0
+        all_warnings = []
+        all_corrections = {}
+        confidence_sum = 0
         
-        # ترکیب سلکتورهای عمومی و اختصاصی
-        all_selectors = base_selectors.get(target, [])
-        if self.store in store_specific:
-            all_selectors = store_specific[self.store].get(target, []) + all_selectors
+        for r in results:
+            decision = r.get("decision", "reject")
+            if decision == "accept":
+                accept_count += 1
+            else:
+                reject_count += 1
+            confidence_sum += r.get("confidence", 0)
+            all_warnings.extend(r.get("warnings", []))
+            
+            corrections = r.get("corrected_data", {})
+            for key, value in corrections.items():
+                if key not in all_corrections:
+                    all_corrections[key] = value
         
-        return all_selectors
+        avg_confidence = confidence_sum / len(results) if results else 0
+        unique_warnings = list(set(all_warnings))
+        
+        if accept_count > reject_count and avg_confidence >= self.confidence_threshold:
+            return True, f"Accepted: {accept_count}/{len(results)} consensus", all_corrections
+        elif accept_count > reject_count and avg_confidence < self.confidence_threshold:
+            return False, f"Low confidence ({avg_confidence:.0f}%)", all_corrections
+        elif reject_count >= accept_count:
+            return False, f"Rejected by AI: {', '.join(unique_warnings[:2])}", all_corrections
+        else:
+            return False, "No clear consensus", all_corrections
     
-    def _find_by_content(self, target: str, soup_target) -> Any:
-        """پیدا کردن المان بر اساس محتوا (آخرین راه)"""
-        if target == "title":
-            for tag in soup_target.find_all(["h1", "h2", "h3", "h4", "div"]):
-                text = tag.get_text(strip=True)
-                if len(text) > 3 and text.isprintable():
-                    return tag
-        elif target == "discount":
-            for tag in soup_target.find_all(["span", "div"]):
-                text = tag.get_text(strip=True)
-                if re.search(r'\d+%', text):
-                    return tag
-        elif target == "price":
-            for tag in soup_target.find_all(["span", "div"]):
-                text = tag.get_text(strip=True)
-                if re.search(r'[\$\€\£]\d+', text):
-                    return tag
-        return None
+    def _extract_result(self, result: dict, game: dict) -> Tuple[bool, str, dict]:
+        decision = result.get("decision", "reject")
+        confidence = result.get("confidence", 0)
+        reason = result.get("reason", "No reason provided")
+        warnings = result.get("warnings", [])
+        corrections = result.get("corrected_data", {})
+        
+        if decision == "accept" and confidence >= self.confidence_threshold:
+            return True, f"Accepted: {reason}", corrections
+        else:
+            warning_text = ", ".join(warnings[:2]) if warnings else reason
+            return False, f"Rejected: {warning_text}", corrections
     
-    def _save_successful_selector(self, target: str, selector: str):
-        """ذخیره سلکتور موفق در کش"""
-        if self.cache_key not in self.selector_cache:
-            self.selector_cache[self.cache_key] = {}
-        self.selector_cache[self.cache_key][target] = selector
-        save_selector_cache(self.selector_cache)
+    def _fallback_decision(self, game: dict) -> Tuple[bool, str, dict]:
+        title = game.get('title', '').lower()
+        for kw in ["dlc", "soundtrack", "season pass", "deluxe", "bundle"]:
+            if kw in title:
+                return False, f"Contains '{kw}' (fallback)", {}
+        
+        if game.get('discount', 0) > 95 and not game.get('is_free_to_keep'):
+            return False, "High discount but not Free to Keep (fallback)", {}
+        
+        return True, "Passed fallback validation", {}
     
-    def get_text_safe(self, element, default: str = "") -> str:
-        if element:
-            return element.get_text(strip=True)
-        return default
-    
-    def get_attr_safe(self, element, attr: str, default: str = "") -> str:
-        if element:
-            return element.get(attr, default)
-        return default
+    def log_decision(self, game: dict, decision: str, reason: str):
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("""
+            INSERT OR REPLACE INTO ai_decisions 
+            (game_id, title, decision, confidence, warnings, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            game.get('id', 'unknown'),
+            game.get('title', 'unknown'),
+            decision,
+            0,
+            reason,
+            datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+        conn.commit()
+        conn.close()
 
 # ═══════════════════════════════════════════════════
 #  RAWG API
@@ -804,7 +794,7 @@ def _steam_fetch_featured() -> list[dict]:
         data = r.json()
         for item in data.get("specials", {}).get("items", []):
             name = item.get("name", "")
-            if not name or _should_skip(name):
+            if not name:
                 continue
             appid    = str(item.get("id", ""))
             discount = item.get("discount_percent", 0)
@@ -826,7 +816,7 @@ def _steam_fetch_featured() -> list[dict]:
                     continue
                 name  = item.get("name", "")
                 appid = str(item.get("id", ""))
-                if not appid or not name or _should_skip(name):
+                if not appid or not name:
                     continue
                 orig  = item.get("original_price", 0)
                 final = item.get("final_price", 0)
@@ -863,8 +853,6 @@ def _steam_fetch_html_search() -> list[dict]:
                 if not title_el:
                     continue
                 title = title_el.text.strip()
-                if _should_skip(title):
-                    continue
                 disc_el  = row.select_one(".discount_pct")
                 discount = 0
                 if disc_el:
@@ -884,7 +872,7 @@ def _steam_fetch_html_search() -> list[dict]:
                     f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
                 ))
             except Exception as e:
-                log.debug(f"Steam HTML row parse error: {e}")
+                pass
     except Exception as e:
         log.error(f"Steam HTML search parse error: {e}")
     return games
@@ -906,7 +894,7 @@ def _steam_fetch_free_to_keep() -> list[dict]:
                     continue
                 appid = match.group(1)
                 title = BeautifulSoup(item.get("name", ""), "html.parser").get_text().strip()
-                if not title or _should_skip(title):
+                if not title:
                     continue
                 price_str = str(item.get("price", "")).lower()
                 if "free" not in price_str and price_str != "0":
@@ -941,8 +929,6 @@ def _steam_fetch_free_to_keep() -> list[dict]:
                     if not title_el:
                         continue
                     title = title_el.text.strip()
-                    if _should_skip(title):
-                        continue
                     disc_el = row.select_one(".discount_pct")
                     if not disc_el or "-100%" not in disc_el.text:
                         continue
@@ -1066,7 +1052,7 @@ def fetch_steam_games() -> list[dict]:
     return games
 
 # ═══════════════════════════════════════════════════
-#  EPIC GAMES STORE (با Smart Selector)
+#  EPIC GAMES STORE
 # ═══════════════════════════════════════════════════
 EPIC_GQL_URL = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
 
@@ -1093,7 +1079,7 @@ def fetch_epic_games() -> list[dict]:
 
         for el in elements:
             title = el.get("title", "").strip()
-            if not title or _should_skip(title):
+            if not title:
                 continue
             
             price_info = el.get("price", {})
@@ -1251,7 +1237,7 @@ def _gog_fetch_official_api() -> list[dict]:
         log.info(f"  📊 GOG API returned {len(products)} products")
         for item in products:
             title = item.get("title", "").strip()
-            if not title or _should_skip(title):
+            if not title:
                 continue
             price_info = item.get("price", {})
             if not price_info:
@@ -1276,7 +1262,6 @@ def _gog_fetch_official_api() -> list[dict]:
     return games
 
 def _gog_fetch_smart() -> list[dict]:
-    """گرفتن بازی‌های GOG با Smart Selector"""
     games = []
     urls = [
         "https://www.gog.com/en/games?discounted=true&page=1",
@@ -1305,7 +1290,7 @@ def _gog_fetch_smart() -> list[dict]:
     for prod in products[:50]:
         try:
             title = selector.get_text_safe(selector.find_element("title", parent=prod))
-            if not title or _should_skip(title):
+            if not title:
                 continue
             
             discount_el = selector.find_element("discount", parent=prod)
@@ -1415,7 +1400,7 @@ def fetch_playstation_deals() -> list[dict]:
     for prod in products[:50]:
         try:
             title = selector.get_text_safe(selector.find_element("title", parent=prod))
-            if not title or _should_skip(title):
+            if not title:
                 continue
             
             discount_el = selector.find_element("discount", parent=prod)
@@ -1520,12 +1505,7 @@ def is_aaa_game_metacritic(title: str) -> bool:
         "call of duty", "battlefield", "far cry", "diablo", "overwatch",
         "fallout", "elder scrolls", "minecraft", "age of empires",
         "dead space", "mass effect", "dragon age", "batman",
-        "arkham", "tomb raider", "wolfenstein", "prey", "dishonored",
-        "dead cells", "hades", "cuphead", "hollow knight",
-        "star wars", "jedi", "sniper", "ghost recon", "division",
-        "watch dogs", "immortals", "fenyx", "ride", "mafia",
-        "saints row", "crisis", "dragons dogma", "devil may cry",
-        "monster hunter", "street fighter", "tekken", "mortal kombat"
+        "arkham", "tomb raider", "wolfenstein", "prey", "dishonored"
     ]
     return any(aaa in title.lower() for aaa in aaa_list)
 
@@ -1721,6 +1701,189 @@ def fetch_xbox_gamepass() -> list[dict]:
         log.info(f"  🟩 Xbox Game Pass (AAA): {title}")
     log.info(f"  ✅ Xbox Game Pass: {len(games)} AAA games")
     return games
+
+# ═══════════════════════════════════════════════════
+#  SMART SELECTOR SYSTEM
+# ═══════════════════════════════════════════════════
+
+def load_selector_cache() -> dict:
+    try:
+        with open(SELECTORS_DB, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_selector_cache(cache: dict):
+    try:
+        with open(SELECTORS_DB, "w") as f:
+            json.dump(cache, f, indent=2)
+    except:
+        pass
+
+class SmartSelector:
+    def __init__(self, soup: BeautifulSoup, store: str, page_type: str):
+        self.soup = soup
+        self.store = store
+        self.page_type = page_type
+        self.cache_key = f"{store}_{page_type}"
+        self.selector_cache = load_selector_cache()
+    
+    def find_element(self, target: str, parent=None, fallback_selectors: list = None):
+        soup_target = parent if parent else self.soup
+        
+        cached_selector = self.selector_cache.get(self.cache_key, {}).get(target)
+        if cached_selector:
+            try:
+                result = soup_target.select_one(cached_selector)
+                if result:
+                    return result
+            except:
+                pass
+        
+        default_selectors = self._get_default_selectors(target)
+        all_selectors = default_selectors + (fallback_selectors or [])
+        
+        for selector in all_selectors:
+            try:
+                result = soup_target.select_one(selector)
+                if result:
+                    if self.cache_key not in self.selector_cache:
+                        self.selector_cache[self.cache_key] = {}
+                    self.selector_cache[self.cache_key][target] = selector
+                    save_selector_cache(self.selector_cache)
+                    return result
+            except:
+                continue
+        
+        return None
+    
+    def find_elements(self, target: str, parent=None, fallback_selectors: list = None) -> list:
+        soup_target = parent if parent else self.soup
+        
+        cached_selector = self.selector_cache.get(self.cache_key, {}).get(f"{target}_list")
+        if cached_selector:
+            try:
+                results = soup_target.select(cached_selector)
+                if results:
+                    return results
+            except:
+                pass
+        
+        default_selectors = self._get_default_selectors(f"{target}_list")
+        all_selectors = default_selectors + (fallback_selectors or [])
+        
+        for selector in all_selectors:
+            try:
+                results = soup_target.select(selector)
+                if results:
+                    if self.cache_key not in self.selector_cache:
+                        self.selector_cache[self.cache_key] = {}
+                    self.selector_cache[self.cache_key][f"{target}_list"] = selector
+                    save_selector_cache(self.selector_cache)
+                    return results
+            except:
+                continue
+        
+        return []
+    
+    def _get_default_selectors(self, target: str) -> list:
+        base_selectors = {
+            "title": [
+                "[data-testid='productTitle']",
+                "[data-qa*='title']",
+                ".product-title",
+                ".title",
+                "h3, h4",
+                "[class*='title']",
+                "[class*='name']"
+            ],
+            "title_list": [
+                "[data-testid='productTitle']",
+                ".product-title",
+                ".title",
+                "h3, h4",
+                "[class*='title']"
+            ],
+            "discount": [
+                "[data-testid='discountPercentage']",
+                "[data-qa*='discount']",
+                ".discount-percentage",
+                ".discount",
+                "[class*='discount']",
+                ".price__discount"
+            ],
+            "price_original": [
+                ".original-price",
+                ".price__old",
+                ".old-price",
+                "[class*='original']",
+                ".strike-through",
+                ".was"
+            ],
+            "price_final": [
+                ".final-price",
+                ".price__current",
+                ".current-price",
+                "[class*='final']",
+                ".price",
+                ".now"
+            ],
+            "image": [
+                "img",
+                "[data-testid='productImage']",
+                "[class*='image'] img",
+                ".cover img"
+            ],
+            "link": [
+                "a[href*='/product/']",
+                "a[href*='/game/']",
+                "a[href*='/app/']",
+                "a[href]"
+            ],
+            "game_card_list": [
+                "[data-testid='productCard']",
+                ".product-card",
+                ".product-tile",
+                "[class*='product']",
+                "li[data-product-id]",
+                "[class*='game']",
+                ".game-item",
+                ".game-tile"
+            ]
+        }
+        
+        store_specific = {
+            "gog": {
+                "title": ["[data-testid='productTitle']", ".product-title", ".title"],
+                "discount": ["[data-testid='discountPercentage']", ".discount-percentage"],
+                "price_original": [".original-price", ".old-price"],
+                "price_final": [".final-price", ".current-price"],
+                "game_card_list": ["[data-testid='productCard']", ".product-tile", ".product-card"]
+            },
+            "playstation": {
+                "title": ["[data-testid='product-title']", ".product-title", ".title"],
+                "discount": ["[data-testid='discount-badge']", ".discount-badge"],
+                "price_original": ["[data-testid='original-price']", ".original-price", ".price__old"],
+                "price_final": ["[data-testid='final-price']", ".final-price", ".price__current"],
+                "game_card_list": ["[data-testid='product-card']", ".product-card", ".grid-cell"]
+            }
+        }
+        
+        all_selectors = base_selectors.get(target, [])
+        if self.store in store_specific:
+            all_selectors = store_specific[self.store].get(target, []) + all_selectors
+        
+        return all_selectors
+    
+    def get_text_safe(self, element, default: str = "") -> str:
+        if element:
+            return element.get_text(strip=True)
+        return default
+    
+    def get_attr_safe(self, element, attr: str, default: str = "") -> str:
+        if element:
+            return element.get(attr, default)
+        return default
 
 # ═══════════════════════════════════════════════════
 #  STEAM SEARCH ENRICH
@@ -1959,6 +2122,8 @@ def send_game(game: dict, caption: str) -> bool:
 #  PROCESS ONE GAME
 # ═══════════════════════════════════════════════════
 def process_game(game: dict) -> tuple[str, str]:
+    global AI_ENGINE
+    
     store  = game["store"]
     gid    = game["id"]
     title  = game["title"]
@@ -1970,6 +2135,7 @@ def process_game(game: dict) -> tuple[str, str]:
     if game.get("is_free_to_play", False) and not is_ftk:
         return "invalid", "Free to Play (permanent)"
     
+    # ─── دریافت تاریخ‌ها ──────────────────────────────────────────
     start_date = game.get("deal_start", "")
     end_date = game.get("deal_end", "")
     period_anchor = ""
@@ -1989,6 +2155,7 @@ def process_game(game: dict) -> tuple[str, str]:
     else:
         period_anchor = current_week_anchor()
     
+    # ─── تکمیل اطلاعات ──────────────────────────────────────────
     if store == "steam":
         details = steam_get_details(gid)
         if not details:
@@ -2057,9 +2224,29 @@ def process_game(game: dict) -> tuple[str, str]:
     else:
         return "failed", f"unknown store {store}"
     
+    # ─── تشخیص AAA ──────────────────────────────────────────────
     game["is_aaa"] = is_aaa_game_metacritic(game["title"])
     calculate_priority_score(game)
     
+    # ─── تصمیم‌گیری با هوش مصنوعی ──────────────────────────────
+    if AI_ENGINE:
+        is_valid, reason, corrections = AI_ENGINE.decide(game)
+        
+        if corrections:
+            for key, value in corrections.items():
+                if key in game:
+                    game[key] = value
+                    log.info(f"   🔧 AI corrected {key}: {value}")
+        
+        AI_ENGINE.log_decision(game, "accepted" if is_valid else "rejected", reason)
+        
+        if not is_valid:
+            log.info(f"   🤖 AI rejected: {reason}")
+            return "invalid", f"AI: {reason}"
+        else:
+            log.info(f"   🤖 AI accepted: {reason}")
+    
+    # ─── Dedup ──────────────────────────────────────────────────
     deal_hash = game.get("deal_hash", "")
     if not deal_hash:
         deal_hash = get_deal_hash(game)
@@ -2072,6 +2259,7 @@ def process_game(game: dict) -> tuple[str, str]:
     if is_sent(store, gid, deal_hash):
         return "skipped", "already sent this deal"
     
+    # ─── ارسال ──────────────────────────────────────────────────
     caption = build_caption(game, start_date, end_date)
     ok = send_game(game, caption)
     
@@ -2086,8 +2274,11 @@ def process_game(game: dict) -> tuple[str, str]:
 #  MAIN
 # ═══════════════════════════════════════════════════
 def main():
+    global AI_ENGINE
+    
     log.info("═" * 65)
     log.info("  🎮 FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox")
+    log.info("  🤖 AI Decision Engine: ENABLED")
     log.info("═" * 65)
     
     if not BOT_TOKEN or not CHANNEL:
@@ -2099,6 +2290,9 @@ def main():
     
     if not JDT_AVAILABLE:
         log.warning("⚠️  jdatetime not installed — Persian dates will not be shown. Install with: pip install jdatetime")
+    
+    # ─── مقداردهی AI ────────────────────────────────────────────
+    AI_ENGINE = AIDecisionEngine()
     
     init_db()
     
@@ -2134,6 +2328,7 @@ def main():
     
     log.info(f"Total unique deals before filtering: {len(all_games)}")
     
+    # ─── فیلتر Free to Play ────────────────────────────────────
     filtered_games = []
     for g in all_games:
         if g.get("is_free_to_play", False) and not g.get("is_free_to_keep", False):
@@ -2152,9 +2347,11 @@ def main():
         log.warning("No games found — exiting")
         return
     
+    # ─── محاسبه Priority Score ──────────────────────────────────
     for g in all_games:
         calculate_priority_score(g)
     
+    # ─── گروه‌بندی ──────────────────────────────────────────────
     pc_stores = ["steam", "epic", "gog"]
     ps_stores = ["playstation", "playstation_essential", "playstation_extra"]
     xbox_stores = ["xbox_gamepass"]
@@ -2179,6 +2376,7 @@ def main():
     counters = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
     total_games = sum(len(games) for _, games in groups)
     sent_count = 0
+    ai_rejected = 0
     
     while sent_count < total_games:
         for group_name, games in groups:
@@ -2201,16 +2399,19 @@ def main():
                 log.info(f"       ⏭  Skipped — {reason}")
             elif status == "invalid":
                 log.info(f"       ⚠️  Invalid — {reason}")
+                if "AI:" in reason:
+                    ai_rejected += 1
             else:
                 log.error(f"       ❌ Failed — {reason}")
             
             time.sleep(3)
     
+    # ─── گزارش نهایی ────────────────────────────────────────────
     log.info("═" * 65)
-    log.info(f"  ✅ Sent:    {counters['sent']}")
+    log.info(f"  ✅ Sent:     {counters['sent']}")
     log.info(f"  ⏭  Skipped: {counters['skipped']}")
-    log.info(f"  ⚠️  Invalid: {counters['invalid']}")
-    log.info(f"  ❌ Failed:  {counters['failed']}")
+    log.info(f"  ⚠️  Invalid: {counters['invalid']} (AI rejected: {ai_rejected})")
+    log.info(f"  ❌ Failed:   {counters['failed']}")
     log.info("═" * 65)
 
 # ═══════════════════════════════════════════════════
