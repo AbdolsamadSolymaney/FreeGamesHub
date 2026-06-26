@@ -1,12 +1,11 @@
 """
 FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-نسخه نهایی با ارسال چرخشی (PC → PS → Xbox)
-- دریافت خودکار تخفیف‌ها و بازی‌های رایگان از فروشگاه‌های معتبر
-- تشخیص بازی‌های AAA با Metacritic (≥75) و RAWG Rating (≥80%)
-- تکمیل اطلاعات از RAWG و Steam
-- کش ۲۴ ساعته برای جلوگیری از ارسال تکراری
-- حداقل تخفیف: ۷۵٪
+نسخه نهایی با:
+- فیلتر بازی‌های Free to Play
+- سیستم امتیازدهی (Priority Score) برای اولویت‌بندی ارسال
+- تشخیص سه دسته: Free to Keep, Free Weekend, Free to Play
+- نمایش تقویم تخفیف (شمسی و میلادی)
 - ارسال چرخشی: PC → PS → Xbox → PC → PS → Xbox → ...
 - اجرای خودکار هر ۱۲ ساعت
 """
@@ -22,6 +21,15 @@ import re
 from bs4 import BeautifulSoup
 import cloudscraper
 import feedparser
+import json
+
+# تلاش برای import jdatetime (برای تاریخ شمسی)
+try:
+    import jdatetime
+    JDT_AVAILABLE = True
+except ImportError:
+    JDT_AVAILABLE = False
+    jdatetime = None
 
 # ═══════════════════════════════════════════════════
 #  LOGGING
@@ -285,6 +293,7 @@ def rawg_search(title: str) -> dict | None:
         rating_pct   = round(rawg_rating / 5 * 100) if rawg_rating else None
         metacritic   = best.get("metacritic")
         bg_image     = best.get("background_image", "") or ""
+        released     = best.get("released", "")
 
         result = {
             "genres":           genres,
@@ -294,6 +303,8 @@ def rawg_search(title: str) -> dict | None:
             "metacritic":       metacritic,
             "rawg_rating":      rawg_rating,
             "background_image": bg_image,
+            "released":         released,
+            "is_free":          False,
         }
         _rawg_cache[cache_key] = result
         return result
@@ -319,6 +330,8 @@ def enrich_epic_gog(game: dict):
         game["metacritic"] = rawg["metacritic"]
     if rawg.get("background_image"):
         game["rawg_image"] = rawg["background_image"]
+    if rawg.get("released"):
+        game["release_date"] = rawg["released"]
 
 # ═══════════════════════════════════════════════════
 #  GAME OBJECT FACTORY
@@ -352,6 +365,10 @@ def make_game(store: str, game_id: str, title: str, discount: int,
         "steam_image":      "",
         "deal_start":       "",
         "deal_end":         "",
+        "release_date":     "",
+        "is_free_to_play":  False,   # برای فیلتر Free to Play
+        "deal_type":        "discount",  # discount, free_to_keep, free_weekend, free_to_play
+        "priority_score":   0,
     }
 
 def _merge(base: list, new_items: list):
@@ -390,6 +407,175 @@ def get_image_candidates(game: dict) -> list[str]:
         candidates.append(game["image_url"])
     
     return candidates
+
+# ═══════════════════════════════════════════════════
+#  PRIORITY SCORE CALCULATION
+# ═══════════════════════════════════════════════════
+def calculate_priority_score(game: dict) -> int:
+    """
+    محاسبه امتیاز اولویت برای بازی بر اساس معیارهای مختلف
+    معیارها:
+    - محبوبیت (RAWG Rating) → 0-25 امتیاز
+    - امتیاز کاربران Steam → 0-20 امتیاز
+    - تعداد Review → 0-15 امتیاز
+    - Metacritic → 0-15 امتیاز
+    - درصد تخفیف → 0-10 امتیاز
+    - AAA بودن → 15 امتیاز
+    - جدید بودن بازی → 10 امتیاز
+    - Free to Keep بودن → 20 امتیاز
+    """
+    score = 0
+    
+    # 1. محبوبیت (RAWG Rating)
+    if game.get("review_pct"):
+        score += min(int(game["review_pct"] / 4), 25)  # max 25
+    elif game.get("rawg_rating"):
+        score += min(int(game.get("rawg_rating", 0) * 5), 25)
+    
+    # 2. Metacritic
+    if game.get("metacritic"):
+        metacritic = game.get("metacritic", 0)
+        if metacritic >= 90:
+            score += 15
+        elif metacritic >= 80:
+            score += 10
+        elif metacritic >= 70:
+            score += 5
+    
+    # 3. تعداد Review
+    if game.get("review_count"):
+        count = game.get("review_count", 0)
+        if count > 100000:
+            score += 15
+        elif count > 50000:
+            score += 10
+        elif count > 10000:
+            score += 5
+        elif count > 1000:
+            score += 3
+    
+    # 4. درصد تخفیف
+    discount = game.get("discount", 0)
+    if discount == 100:
+        score += 10
+    elif discount >= 90:
+        score += 8
+    elif discount >= 80:
+        score += 5
+    elif discount >= 75:
+        score += 3
+    
+    # 5. AAA بودن
+    if game.get("is_aaa", False):
+        score += 15
+    
+    # 6. جدید بودن (بر اساس تاریخ انتشار)
+    if game.get("release_date"):
+        try:
+            release = datetime.datetime.fromisoformat(game["release_date"].replace("Z", "+00:00")).replace(tzinfo=None)
+            now = datetime.datetime.utcnow()
+            days_old = (now - release).days
+            if days_old < 30:
+                score += 10
+            elif days_old < 90:
+                score += 5
+            elif days_old < 365:
+                score += 2
+        except:
+            pass
+    
+    # 7. Free to Keep
+    if game.get("is_free_to_keep", False):
+        score += 20
+    
+    # 8. Free to Play (امتیاز منفی برای فیلتر)
+    if game.get("is_free_to_play", False):
+        score = -999  # حذف کامل
+    
+    game["priority_score"] = score
+    return score
+
+# ═══════════════════════════════════════════════════
+#  DEAL TYPE DETECTION
+# ═══════════════════════════════════════════════════
+def detect_deal_type(game: dict) -> str:
+    """
+    تشخیص نوع تخفیف:
+    - free_to_keep: بازی را برای همیشه نگه دار
+    - free_weekend: آخر هفته رایگان
+    - free_to_play: کاملاً رایگان
+    - discount: تخفیف معمولی
+    """
+    if game.get("is_free_to_play", False):
+        return "free_to_play"
+    
+    if game.get("is_free_to_keep", False):
+        return "free_to_keep"
+    
+    # بررسی Free Weekend (معمولاً ۱۰۰٪ تخفیف ولی موقت)
+    if game.get("discount") == 100 and not game.get("is_free_to_keep"):
+        # اگر تاریخ پایان نزدیک باشد (کمتر از ۷ روز) احتمالاً Free Weekend
+        if game.get("deal_end"):
+            try:
+                end = datetime.datetime.strptime(game["deal_end"], "%Y-%m-%d")
+                now = datetime.datetime.utcnow()
+                if (end - now).days <= 7:
+                    return "free_weekend"
+            except:
+                pass
+        return "free_weekend"
+    
+    return "discount"
+
+def get_deal_emoji(deal_type: str) -> str:
+    if deal_type == "free_to_keep":
+        return "🟢"
+    elif deal_type == "free_weekend":
+        return "🟡"
+    elif deal_type == "free_to_play":
+        return "🔵"
+    else:
+        return "🟣"  # discount
+
+def get_deal_label(deal_type: str) -> str:
+    if deal_type == "free_to_keep":
+        return "Free to Keep (برای همیشه)"
+    elif deal_type == "free_weekend":
+        return "Free Weekend (آخر هفته رایگان)"
+    elif deal_type == "free_to_play":
+        return "Free to Play (کاملاً رایگان)"
+    else:
+        return f"{game.get('discount', 0)}% تخفیف"
+
+# ═══════════════════════════════════════════════════
+#  DATE FORMATTER (تاریخ شمسی و میلادی)
+# ═══════════════════════════════════════════════════
+def format_date_persian_english(date_str: str) -> str:
+    """تبدیل تاریخ میلادی به شمسی و میلادی"""
+    if not date_str:
+        return "نامشخص"
+    
+    try:
+        # تلاش برای parse تاریخ میلادی
+        if "T" in date_str:
+            dt = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        else:
+            dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        
+        # تاریخ میلادی
+        gregorian = dt.strftime("%d %b %Y")
+        
+        # تاریخ شمسی
+        if JDT_AVAILABLE and jdatetime:
+            jd = jdatetime.datetime.fromgregorian(datetime=dt)
+            persian = jd.strftime("%Y/%m/%d")
+            return f"{persian}\n{gregorian}"
+        else:
+            return gregorian
+            
+    except Exception as e:
+        log.debug(f"Date formatting error: {e}")
+        return date_str
 
 # ═══════════════════════════════════════════════════
 #  STEAM SOURCES
@@ -598,7 +784,12 @@ def steam_get_reviews(appid: str):
     except:
         return None, None, ""
 
-def steam_get_promo_info(appid: str, is_ftk: bool) -> tuple[str, str]:
+def steam_get_promo_info(appid: str, is_ftk: bool) -> tuple[str, str, str]:
+    """
+    برمی‌گردونه: (start_date, end_date, period_anchor)
+    """
+    start_date = ""
+    end_date = ""
     r = safe_get(f"https://store.steampowered.com/app/{appid}/", retries=2, delay=1)
     if r:
         try:
@@ -606,25 +797,43 @@ def steam_get_promo_info(appid: str, is_ftk: bool) -> tuple[str, str]:
             block = soup.select_one(".discount_block")
             if block:
                 text  = block.get_text(separator=" ", strip=True)
-                match = re.search(
+                # تاریخ شروع
+                match_start = re.search(
+                    r"Offer starts\s+([\w]+\s+\d{1,2},\s+\d{4})",
+                    text, re.IGNORECASE
+                )
+                if match_start:
+                    try:
+                        start_dt = datetime.datetime.strptime(match_start.group(1), "%b %d, %Y")
+                        start_date = start_dt.strftime("%Y-%m-%d")
+                    except:
+                        pass
+                
+                # تاریخ پایان
+                match_end = re.search(
                     r"Offer ends\s+([\w]+\s+\d{1,2},\s+\d{4})",
                     text, re.IGNORECASE
                 )
-                if match:
-                    end_str = match.group(1)
+                if match_end:
                     try:
-                        end_dt  = datetime.datetime.strptime(end_str, "%b %d, %Y")
-                        display = end_dt.strftime("%Y-%m-%d")
-                        prefix  = "FTK" if is_ftk else "END"
-                        return display, f"{prefix}:{display}"
-                    except ValueError:
+                        end_dt = datetime.datetime.strptime(match_end.group(1), "%b %d, %Y")
+                        end_date = end_dt.strftime("%Y-%m-%d")
+                    except:
                         pass
         except Exception as e:
             log.debug(f"Steam date extraction failed ({appid}): {e}")
 
     week = current_week_anchor()
     prefix = "FTK:" if is_ftk else ""
-    return "Unknown", f"{prefix}{week}"
+    period_anchor = f"{prefix}{week}"
+    return start_date, end_date, period_anchor
+
+def steam_is_free_to_play(appid: str) -> bool:
+    """بررسی اینکه آیا بازی کاملاً Free to Play است"""
+    details = steam_get_details(appid)
+    if details:
+        return details.get("is_free", False)
+    return False
 
 def fetch_steam_games() -> list[dict]:
     games = []
@@ -674,6 +883,13 @@ def fetch_epic_games() -> list[dict]:
             title = el.get("title", "").strip()
             if not title or _should_skip(title):
                 continue
+            
+            # بررسی Free to Play بودن
+            if el.get("price", {}).get("totalPrice", {}).get("discountPrice", 0) == 0:
+                # اگر بازی به صورت دائمی رایگان است، skip کن
+                if not el.get("promotions", {}).get("promotionalOffers"):
+                    continue
+            
             promotions   = el.get("promotions") or {}
             promo_offers = promotions.get("promotionalOffers", [])
             if not promo_offers:
@@ -741,14 +957,14 @@ def fetch_epic_games() -> list[dict]:
     log.info(f"Epic Games total: {len(games)}")
     return games
 
-def epic_get_promo_info(game: dict) -> tuple[str, str]:
+def epic_get_promo_info(game: dict) -> tuple[str, str, str]:
     r = safe_get(
         EPIC_GQL_URL,
         params={"locale": "en-US", "country": "US", "allowCountries": "US"},
         extra_headers={"Referer": "https://store.epicgames.com/"},
     )
     if not r:
-        return "Unknown", f"FTK:{current_week_anchor()}"
+        return "", "", f"FTK:{current_week_anchor()}"
 
     try:
         data     = r.json()
@@ -767,68 +983,66 @@ def epic_get_promo_info(game: dict) -> tuple[str, str]:
             promo_offers = promotions.get("promotionalOffers", [])
             for offer_group in promo_offers:
                 for offer in offer_group.get("promotionalOffers", []):
+                    start = offer.get("startDate", "")
                     end = offer.get("endDate", "")
                     try:
+                        start_dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).replace(tzinfo=None)
                         end_dt = datetime.datetime.fromisoformat(end.replace("Z", "+00:00")).replace(tzinfo=None)
                         if end_dt > now:
-                            display = end_dt.strftime("%Y-%m-%d")
-                            return display, f"FTK:{display}"
+                            return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"), f"FTK:{end_dt.strftime('%Y-%m-%d')}"
                     except:
                         pass
     except:
         pass
 
-    return "Unknown", f"FTK:{current_week_anchor()}"
+    return "", "", f"FTK:{current_week_anchor()}"
 
 # ═══════════════════════════════════════════════════
 #  GOG — نسخه بهبودیافته با سلکتورهای جدید
 # ═══════════════════════════════════════════════════
 
 def fetch_gog_games() -> list[dict]:
-    """گرفتن بازی‌های GOG با تخفیف ≥۷۵٪ و رایگان"""
+    """گرفتن بازی‌های GOG با تخفیف ≥۷۵٪ و رایگان (نسخه مقاوم)"""
     games = []
     
-    # منبع ۱: API رسمی GOG (با پارامترهای جدید)
-    log.info("  🔍 Fetching GOG via API")
-    games_api = _gog_fetch_api()
+    log.info("  🔍 Fetching GOG via API (official)")
+    games_api = _gog_fetch_official_api()
     _merge(games, games_api)
     log.info(f"  GOG API: {len(games_api)} games")
     
-    # منبع ۲: اسکرپینگ صفحه اصلی (برای بازی‌های رایگان)
-    log.info("  🔍 Fetching GOG via scraping")
-    games_scrape = _gog_fetch_scrape()
-    before = len(games)
-    _merge(games, games_scrape)
-    log.info(f"  GOG Scrape: {len(games_scrape)} raw → {len(games)-before} new")
+    if len(games) < 5:
+        log.info("  🔍 Fetching GOG via scraping (fallback)")
+        games_scrape = _gog_fetch_scrape_improved()
+        before = len(games)
+        _merge(games, games_scrape)
+        log.info(f"  GOG Scrape: {len(games_scrape)} raw → {len(games)-before} new")
     
-    # منبع ۳: صفحه تخفیف‌های ویژه
-    log.info("  🔍 Fetching GOG via specials page")
-    games_specials = _gog_fetch_specials()
-    before = len(games)
-    _merge(games, games_specials)
-    log.info(f"  GOG Specials: {len(games_specials)} raw → {len(games)-before} new")
+    if len(games) < 3:
+        log.info("  🔍 Fetching GOG via third-party (gg.deals)")
+        games_third = _gog_fetch_third_party()
+        before = len(games)
+        _merge(games, games_third)
+        log.info(f"  GOG Third-party: {len(games_third)} raw → {len(games)-before} new")
     
     log.info(f"  ✅ GOG total: {len(games)} games found")
     return games
 
-def _gog_fetch_api() -> list[dict]:
-    """گرفتن بازی‌ها از API رسمی GOG با پارامترهای به‌روز"""
+def _gog_fetch_official_api() -> list[dict]:
     games = []
-    
-    # API جدید GOG
     url = "https://catalog.gog.com/v1/catalog"
     params = {
         "limit": 100,
         "order": "desc:trending",
         "discounted": "true",
-        "productType": "in:game,dlc",
+        "productType": "in:game",
         "page": 1,
         "countryCode": "US",
-        "currencyCode": "USD"
+        "currencyCode": "USD",
+        "price": "0,1000"
     }
     
     r = safe_get(url, params=params, use_scraper=True, retries=3, delay=2,
-                 extra_headers={"Referer": "https://www.gog.com/"})
+                 extra_headers={"Referer": "https://www.gog.com/", "Accept": "application/json"})
     
     if not r:
         log.warning("  ⚠️ GOG API failed")
@@ -837,46 +1051,33 @@ def _gog_fetch_api() -> list[dict]:
     try:
         data = r.json()
         products = data.get("products", [])
+        log.info(f"  📊 GOG API returned {len(products)} products")
         
         for item in products:
             title = item.get("title", "").strip()
             if not title or _should_skip(title):
                 continue
             
-            # استخراج قیمت و تخفیف
             price_info = item.get("price", {})
             if not price_info:
                 continue
             
             discount = int(price_info.get("discountPercentage", 0) or 0)
-            
-            # فیلتر تخفیف ≥۷۵٪ یا رایگان
             if discount < MIN_DISCOUNT and discount != 100:
                 continue
             
-            # قیمت‌ها
             base_price = price_info.get("base", 0)
             final_price = price_info.get("final", 0)
-            
             orig_fmt = f"${float(base_price):.2f}" if base_price else ""
             final_fmt = f"${float(final_price):.2f}" if final_price else ("FREE" if discount == 100 else "")
             
-            # لینک
             slug = item.get("slug", "")
             link = f"https://www.gog.com/en/game/{slug}" if slug else "https://www.gog.com"
-            
-            # تصویر
             cover = item.get("coverHorizontal", "") or item.get("cover", "")
-            
             game_id = str(item.get("id", slug or title))
             is_ftk = (discount == 100 and final_price == 0)
             
-            game = make_game(
-                "gog", game_id, title, discount,
-                link, orig_fmt, final_fmt,
-                image_url=cover,
-                is_free_to_keep=is_ftk
-            )
+            game = make_game("gog", game_id, title, discount, link, orig_fmt, final_fmt, image_url=cover, is_free_to_keep=is_ftk)
             games.append(game)
             log.info(f"  🟣 GOG API: {title} -{discount}%")
             
@@ -885,55 +1086,48 @@ def _gog_fetch_api() -> list[dict]:
     
     return games
 
-def _gog_fetch_scrape() -> list[dict]:
-    """اسکرپینگ صفحه GOG برای بازی‌های رایگان و تخفیفی"""
+def _gog_fetch_scrape_improved() -> list[dict]:
     games = []
-    
-    # صفحه اصلی GOG
     urls = [
-        "https://www.gog.com/en/games",
-        "https://www.gog.com/en/games?discounted=true",
-        "https://www.gog.com/en/games?priceRange=0,0"
+        "https://www.gog.com/en/games?discounted=true&page=1",
+        "https://www.gog.com/en/games?discounted=true&page=2",
+        "https://www.gog.com/en/games?priceRange=0,0",
+        "https://www.gog.com/en/games"
     ]
     
+    r = None
     for url in urls:
-        r = safe_get(url, use_scraper=True, retries=3, delay=3,
+        log.info(f"    Trying: {url}")
+        r = safe_get(url, use_scraper=True, retries=2, delay=3,
                      extra_headers={"Referer": "https://www.gog.com/"})
         if r:
             break
     
     if not r:
-        log.warning("  ⚠️ GOG scrape failed")
+        log.warning("  ⚠️ GOG scrape failed for all URLs")
         return games
     
     try:
         soup = BeautifulSoup(r.text, "html.parser")
-        
-        # سلکتورهای جدید GOG (بر اساس ساختار فعلی)
-        products = (
-            soup.select("[data-testid='productCard']") or
-            soup.select(".product-tile") or
-            soup.select(".product-card") or
-            soup.select("[class*='product']") or
-            soup.select("[data-product-id]")
-        )
-        
-        # اگر هیچ محصولی پیدا نشد، از سلکتورهای عمومی استفاده کن
+        products = []
+        products = soup.select("[data-testid='productCard']")
+        if not products:
+            products = soup.select(".product-tile, .product-card, [class*='product']")
         if not products:
             products = soup.select("a[href*='/en/game/']")
-            # فیلتر کردن لینک‌های تکراری
             seen = set()
-            unique_products = []
+            unique = []
             for p in products:
                 href = p.get("href", "")
                 if href and href not in seen:
                     seen.add(href)
-                    unique_products.append(p)
-            products = unique_products
+                    unique.append(p)
+            products = unique
+        
+        log.info(f"    Found {len(products)} potential products")
         
         for prod in products[:50]:
             try:
-                # استخراج عنوان
                 title_el = (
                     prod.select_one("[data-testid='productTitle']") or
                     prod.select_one(".product-title") or
@@ -947,7 +1141,6 @@ def _gog_fetch_scrape() -> list[dict]:
                 if not title or _should_skip(title):
                     continue
                 
-                # استخراج تخفیف
                 discount_el = (
                     prod.select_one("[data-testid='discountPercentage']") or
                     prod.select_one(".discount-percentage") or
@@ -961,7 +1154,6 @@ def _gog_fetch_scrape() -> list[dict]:
                     except:
                         pass
                 
-                # اگر تخفیف پیدا نشد، از قیمت‌ها استفاده کن
                 if discount == 0:
                     price_el = prod.select_one(".final-price, .price, [class*='price']")
                     if price_el:
@@ -972,23 +1164,20 @@ def _gog_fetch_scrape() -> list[dict]:
                 if discount < MIN_DISCOUNT and discount != 100:
                     continue
                 
-                # استخراج قیمت‌ها
                 orig_el = prod.select_one(".original-price, .old-price, [class*='original']")
                 final_el = prod.select_one(".final-price, .current-price, [class*='final']")
                 orig = orig_el.get_text(strip=True) if orig_el else ""
                 final = final_el.get_text(strip=True) if final_el else ""
                 
-                # استخراج لینک
-                link_el = prod.select_one("a[href*='/en/game/']")
+                link_el = prod.select_one("a[href*='/en/game/']") if prod.name != "a" else prod
                 if not link_el:
-                    link_el = prod
+                    link_el = prod.select_one("a[href]")
                 link = link_el.get("href", "") if link_el else ""
                 if link and not link.startswith("http"):
                     link = "https://www.gog.com" + link
                 if not link or "/en/game/" not in link:
                     continue
                 
-                # استخراج تصویر
                 img_el = prod.select_one("img")
                 image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
                 if image_url and image_url.startswith("//"):
@@ -996,7 +1185,6 @@ def _gog_fetch_scrape() -> list[dict]:
                 if image_url:
                     image_url = image_url.replace("_small", "_large").replace("_thumb", "_original")
                 
-                # استخراج ID بازی
                 game_id = ""
                 if link:
                     match = re.search(r"/game/([^/?]+)", link)
@@ -1006,12 +1194,7 @@ def _gog_fetch_scrape() -> list[dict]:
                     game_id = title.lower().replace(" ", "-").replace(":", "")
                 
                 is_ftk = (discount == 100)
-                
-                game = make_game(
-                    "gog", game_id, title, discount,
-                    link, orig, final, image_url,
-                    is_free_to_keep=is_ftk
-                )
+                game = make_game("gog", game_id, title, discount, link, orig, final, image_url, is_free_to_keep=is_ftk)
                 games.append(game)
                 log.info(f"  🟣 GOG Scrape: {title} -{discount}%")
                 
@@ -1023,39 +1206,30 @@ def _gog_fetch_scrape() -> list[dict]:
     
     return games
 
-def _gog_fetch_specials() -> list[dict]:
-    """گرفتن بازی‌ها از صفحه تخفیف‌های ویژه GOG"""
+def _gog_fetch_third_party() -> list[dict]:
     games = []
-    
-    url = "https://www.gog.com/en/games?discounted=true&page=1"
-    r = safe_get(url, use_scraper=True, retries=3, delay=3,
-                 extra_headers={"Referer": "https://www.gog.com/"})
+    url = "https://gg.deals/deals/gog/"
+    log.info(f"    Fetching from gg.deals")
+    r = safe_get(url, use_scraper=True, retries=2, delay=3,
+                 extra_headers={"Referer": "https://gg.deals/"})
     
     if not r:
         return games
     
     try:
         soup = BeautifulSoup(r.text, "html.parser")
+        deals = soup.select(".deal-item, .game-item, [class*='deal']")
         
-        # پیدا کردن تمام کارت‌های بازی
-        cards = (
-            soup.select("[data-testid='productCard']") or
-            soup.select(".product-tile") or
-            soup.select("[class*='product']")
-        )
-        
-        for card in cards[:30]:
+        for deal in deals[:30]:
             try:
-                # عنوان
-                title_el = card.select_one("[data-testid='productTitle'], .title, h3")
+                title_el = deal.select_one(".title, .name, h3")
                 if not title_el:
                     continue
                 title = title_el.get_text(strip=True)
                 if not title or _should_skip(title):
                     continue
                 
-                # تخفیف
-                disc_el = card.select_one("[class*='discount']")
+                disc_el = deal.select_one(".discount, .price-off")
                 discount = 0
                 if disc_el:
                     disc_text = disc_el.get_text(strip=True).replace("%", "").replace("-", "")
@@ -1067,70 +1241,58 @@ def _gog_fetch_specials() -> list[dict]:
                 if discount < MIN_DISCOUNT and discount != 100:
                     continue
                 
-                # لینک
-                link_el = card.select_one("a[href*='/en/game/']")
+                link_el = deal.select_one("a[href]")
                 link = link_el.get("href", "") if link_el else ""
                 if link and not link.startswith("http"):
-                    link = "https://www.gog.com" + link
+                    link = "https://gg.deals" + link
                 
-                # تصویر
-                img_el = card.select_one("img")
+                img_el = deal.select_one("img")
                 image_url = img_el.get("src") or img_el.get("data-src", "") if img_el else ""
                 if image_url and image_url.startswith("//"):
                     image_url = "https:" + image_url
                 
-                game_id = ""
-                if link:
-                    match = re.search(r"/game/([^/?]+)", link)
-                    if match:
-                        game_id = match.group(1)
-                if not game_id:
-                    game_id = title.lower().replace(" ", "-")
-                
-                is_ftk = (discount == 100)
-                
-                game = make_game(
-                    "gog", game_id, title, discount,
-                    link, "", "", image_url,
-                    is_free_to_keep=is_ftk
-                )
+                game_id = title.lower().replace(" ", "-").replace(":", "")
+                game = make_game("gog", game_id, title, discount, link or "https://www.gog.com", "", "", image_url, is_free_to_keep=(discount == 100))
                 games.append(game)
+                log.info(f"  🟣 GOG Third-party: {title} -{discount}%")
                 
             except Exception as e:
                 continue
                 
     except Exception as e:
-        log.warning(f"  ⚠️ GOG specials parse error: {e}")
+        log.warning(f"  ⚠️ GOG third-party error: {e}")
     
     return games
 
-def gog_get_promo_info(game: dict) -> tuple[str, str]:
+def gog_get_promo_info(game: dict) -> tuple[str, str, str]:
     r = safe_get(game["link"], retries=2, delay=1,
                  extra_headers={"Referer": "https://www.gog.com/"})
+    start_date = ""
+    end_date = ""
     if r:
         try:
             soup = BeautifulSoup(r.text, "html.parser")
             for el in soup.select("[data-test-id='discountCountdown'], .discount-countdown, [class*='countdown']"):
                 text = el.get_text(strip=True)
-                match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
-                if match:
-                    display = match.group(1)
-                    prefix  = "FTK" if game.get("is_free_to_keep") else "END"
-                    return display, f"{prefix}:{display}"
+                match_start = re.search(r"Starts\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
+                if match_start:
+                    start_date = match_start.group(1)
+                match_end = re.search(r"Ends\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
+                if match_end:
+                    end_date = match_end.group(1)
         except Exception as e:
             log.debug(f"GOG date extraction failed: {e}")
 
-    week   = current_week_anchor()
+    week = current_week_anchor()
     prefix = "FTK:" if game.get("is_free_to_keep") else ""
-    return "Unknown", f"{prefix}{week}"
+    period_anchor = f"{prefix}{week}"
+    return start_date, end_date, period_anchor
 
 # ═══════════════════════════════════════════════════
 #  PLAYSTATION DEALS
 # ═══════════════════════════════════════════════════
 def fetch_playstation_deals() -> list[dict]:
-    """بازی‌های با تخفیف ≥۷۵٪ از فروشگاه PlayStation"""
     games = []
-    
     urls = [
         "https://store.playstation.com/en-us/pages/deals",
         "https://store.playstation.com/en-us/deals",
@@ -1151,13 +1313,11 @@ def fetch_playstation_deals() -> list[dict]:
 
     try:
         soup = BeautifulSoup(r.text, "html.parser")
-        
         products = []
         for a in soup.select("a[href*='/en-us/product/']"):
             parent = a.parent
             if parent:
                 products.append(parent)
-        
         if not products:
             products = soup.select("[data-qa*='product']")
         if not products:
@@ -1226,11 +1386,7 @@ def fetch_playstation_deals() -> list[dict]:
                 orig = orig_el.get_text(strip=True) if orig_el else ""
                 final = final_el.get_text(strip=True) if final_el else ""
                 
-                game = make_game(
-                    "playstation", game_id, title, discount,
-                    link, orig, final, image_url,
-                    is_free_to_keep=(discount == 100 and "free" in final.lower())
-                )
+                game = make_game("playstation", game_id, title, discount, link, orig, final, image_url, is_free_to_keep=(discount == 100 and "free" in final.lower()))
                 games.append(game)
                 log.info(f"  🎮 PS Deal: {title} -{discount}%")
                 
@@ -1243,58 +1399,57 @@ def fetch_playstation_deals() -> list[dict]:
     log.info(f"  ✅ PlayStation deals: {len(games)} games found")
     return games
 
-def playstation_get_promo_info(game: dict) -> tuple[str, str]:
+def playstation_get_promo_info(game: dict) -> tuple[str, str, str]:
     if not game.get("link"):
-        return "Unknown", f"END:{current_week_anchor()}"
+        return "", "", f"END:{current_week_anchor()}"
     r = safe_get(game["link"], retries=2, delay=1, use_scraper=True,
                  extra_headers={"Referer": "https://store.playstation.com/"})
+    start_date = ""
+    end_date = ""
     if r:
         try:
             soup = BeautifulSoup(r.text, "html.parser")
+            for el in soup.select(".offer-start, .countdown, [data-testid='offer-start']"):
+                text = el.get_text(strip=True)
+                match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text)
+                if match:
+                    try:
+                        start_dt = datetime.datetime.strptime(match.group(1), "%m/%d/%Y")
+                        start_date = start_dt.strftime("%Y-%m-%d")
+                    except:
+                        pass
             for el in soup.select(".offer-end, .countdown, [data-testid='offer-end']"):
                 text = el.get_text(strip=True)
                 match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text)
                 if match:
-                    display = match.group(1)
-                    return display, f"END:{display}"
-                match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
-                if match:
-                    display = match.group(1)
-                    return display, f"END:{display}"
+                    try:
+                        end_dt = datetime.datetime.strptime(match.group(1), "%m/%d/%Y")
+                        end_date = end_dt.strftime("%Y-%m-%d")
+                    except:
+                        pass
         except Exception as e:
             pass
-    return "Unknown", f"END:{current_week_anchor()}"
+    return start_date, end_date, f"END:{current_week_anchor()}"
 
 # ═══════════════════════════════════════════════════
 #  AAA DETECTION WITH METACRITIC
 # ═══════════════════════════════════════════════════
 
 def is_aaa_game_metacritic(title: str) -> bool:
-    """
-    تشخیص بازی AAA با استفاده از Metacritic
-    - اگر RAWG_API_KEY تنظیم شده باشد، از متاکریتیک استفاده می‌کند
-    - در غیر این صورت از لیست دستی استفاده می‌کند
-    """
-    # اگر RAWG_API_KEY تنظیم شده باشد
     if RAWG_API_KEY:
         rawg = rawg_search(title)
         if rawg:
             metacritic = rawg.get("metacritic")
             rating_pct = rawg.get("rating_pct")
             ratings_count = rawg.get("ratings_count", 0)
-            
-            # شرط AAA: متاکریتیک ≥ 75 یا امتیاز RAWG ≥ 80%
             if metacritic and metacritic >= AAA_METACRITIC_THRESHOLD:
                 return True
             if rating_pct and rating_pct >= AAA_RATING_THRESHOLD:
                 return True
-            # بازی‌های پرطرفدار با بیش از 2000 نقد
             if ratings_count > AAA_REVIEWS_THRESHOLD:
                 return True
     
-    # Fallback: لیست دستی (اگر RAWG_API_KEY تنظیم نشده باشد)
     aaa_list = [
-        # بازی‌های AAA معروف
         "halo", "forza", "gears of war", "starfield", "doom",
         "cyberpunk", "witcher", "red dead", "gta", "assassin's creed",
         "final fantasy", "resident evil", "god of war", "spider-man",
@@ -1317,7 +1472,6 @@ def is_aaa_game_metacritic(title: str) -> bool:
     return any(aaa in title.lower() for aaa in aaa_list)
 
 def enrich_from_metacritic(game: dict) -> bool:
-    """تکمیل اطلاعات بازی از Metacritic از طریق RAWG"""
     if not RAWG_API_KEY:
         return False
     
@@ -1327,22 +1481,19 @@ def enrich_from_metacritic(game: dict) -> bool:
     
     if not game.get("genres") and rawg.get("genres"):
         game["genres"] = rawg["genres"]
-    
     if not game.get("description") and rawg.get("description"):
         game["description"] = rawg["description"]
-    
     if not game.get("review_pct") and rawg.get("rating_pct"):
         game["review_pct"] = rawg["rating_pct"]
         game["review_count"] = rawg.get("ratings_count", 0)
         if rawg.get("metacritic"):
             game["review_desc"] = f"Metacritic: {rawg['metacritic']}"
-    
     if not game.get("metacritic") and rawg.get("metacritic"):
         game["metacritic"] = rawg["metacritic"]
-    
     if not game.get("rawg_image") and rawg.get("background_image"):
         game["rawg_image"] = rawg["background_image"]
-    
+    if not game.get("release_date") and rawg.get("released"):
+        game["release_date"] = rawg["released"]
     return True
 
 # ═══════════════════════════════════════════════════
@@ -1350,7 +1501,6 @@ def enrich_from_metacritic(game: dict) -> bool:
 # ═══════════════════════════════════════════════════
 
 def fetch_playstation_plus_essential() -> list[dict]:
-    """گرفتن بازی‌های PS Plus Essential از RSS وبلاگ رسمی PlayStation"""
     games = []
     log.info("  🔍 Fetching PS Plus Essential from official PlayStation Blog RSS")
     
@@ -1366,7 +1516,6 @@ def fetch_playstation_plus_essential() -> list[dict]:
             content = entry.content[0].value if hasattr(entry, 'content') else entry.description
             full_text = title + " " + content
             
-            # روش اول: جستجوی الگوی "Game A, Game B, and Game C"
             pattern1 = r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*,\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*(?:,?\s*and\s*|\s*&\s*)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'
             matches = re.findall(pattern1, full_text)
             
@@ -1384,7 +1533,6 @@ def fetch_playstation_plus_essential() -> list[dict]:
                     log.info(f"    Found {len(games)} games from RSS")
                     return games
             
-            # روش دوم: جستجوی نام بازی‌های معروف
             famous_games = [
                 "God of War", "Horizon", "Uncharted", "The Last of Us",
                 "Final Fantasy", "Resident Evil", "Cyberpunk", "The Witcher",
@@ -1407,7 +1555,6 @@ def fetch_playstation_plus_essential() -> list[dict]:
     except Exception as e:
         log.warning(f"  ⚠️ RSS error: {e}")
     
-    # اگر هیچ بازی پیدا نشد، از یک منبع ثابت استفاده کن
     if not games:
         log.info("  🔍 Fallback: using static list of current PS Plus games")
         current_games = [
@@ -1430,7 +1577,6 @@ def fetch_playstation_plus_essential() -> list[dict]:
 # ═══════════════════════════════════════════════════
 
 def fetch_playstation_plus_extra() -> list[dict]:
-    """گرفتن بازی‌های PS Plus Extra از RSS وبلاگ رسمی PlayStation"""
     games = []
     log.info("  🔍 Fetching PS Plus Extra from official PlayStation Blog RSS")
     
@@ -1446,7 +1592,6 @@ def fetch_playstation_plus_extra() -> list[dict]:
             content = entry.content[0].value if hasattr(entry, 'content') else entry.description
             full_text = title + " " + content
             
-            # بازی‌های AAA معروف
             aaa_games = [
                 "God of War", "Horizon", "Uncharted", "The Last of Us",
                 "Final Fantasy", "Resident Evil", "Cyberpunk", "The Witcher",
@@ -1470,7 +1615,6 @@ def fetch_playstation_plus_extra() -> list[dict]:
     except Exception as e:
         log.warning(f"  ⚠️ RSS Extra error: {e}")
     
-    # اگر هیچ بازی پیدا نشد، از یک منبع ثابت استفاده کن
     if not games:
         log.info("  🔍 Fallback: using static list of current PS Plus Extra games")
         current_extra_games = [
@@ -1489,15 +1633,13 @@ def fetch_playstation_plus_extra() -> list[dict]:
     return games
 
 # ═══════════════════════════════════════════════════
-#  XBOX GAME PASS — با Metacritic برای تشخیص AAA
+#  XBOX GAME PASS
 # ═══════════════════════════════════════════════════
 
 def fetch_xbox_gamepass() -> list[dict]:
-    """گرفتن بازی‌های Xbox Game Pass با تشخیص AAA از Metacritic"""
     games = []
     log.info("  🔍 Fetching Xbox Game Pass with Metacritic detection")
     
-    # لیست گسترده بازی‌های Game Pass با Steam ID
     current_games = [
         ("Starfield", "starfield", 1716740),
         ("Forza Horizon 5", "forza-horizon-5", 1551360),
@@ -1532,31 +1674,23 @@ def fetch_xbox_gamepass() -> list[dict]:
     ]
     
     for title, slug, steam_id in current_games:
-        # بررسی AAA با Metacritic
         if not is_aaa_game_metacritic(title):
             log.debug(f"  ⏭️ Skipping {title} (not AAA)")
             continue
         
-        # تصویر از استیم
-        image_url = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{steam_id}/capsule_616x353.jpg"
+        # بررسی Free to Play بودن
+        if steam_id > 0:
+            if steam_is_free_to_play(str(steam_id)):
+                log.debug(f"  ⏭️ Skipping {title} (Free to Play)")
+                continue
         
-        # اگر steam_id صفر باشد، از RAWG استفاده کن
+        image_url = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{steam_id}/capsule_616x353.jpg"
         if steam_id == 0:
             rawg = rawg_search(title)
             if rawg and rawg.get("background_image"):
                 image_url = rawg["background_image"]
         
-        game = make_game(
-            "xbox_gamepass", 
-            slug, 
-            title, 
-            0,
-            "https://www.xbox.com/en-US/xbox-game-pass", 
-            "", 
-            "Included in Game Pass", 
-            image_url,
-            is_free_to_keep=False
-        )
+        game = make_game("xbox_gamepass", slug, title, 0, "https://www.xbox.com/en-US/xbox-game-pass", "", "Included in Game Pass", image_url, is_free_to_keep=False)
         games.append(game)
         log.info(f"  🟩 Xbox Game Pass (AAA): {title}")
     
@@ -1612,27 +1746,35 @@ def enrich_from_steam(game: dict) -> bool:
             game["review_count"] = rev_count
             game["review_desc"] = rev_desc
     game["steam_image"] = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"
+    
+    # بررسی Free to Play
+    if details.get("is_free", False):
+        game["is_free_to_play"] = True
+    
     return True
 
 # ═══════════════════════════════════════════════════
-#  CAPTION BUILDER
+#  CAPTION BUILDER — با تقویم تخفیف و نوع تخفیف
 # ═══════════════════════════════════════════════════
-def build_caption(game: dict, end_date: str) -> str:
+def build_caption(game: dict, start_date: str, end_date: str) -> str:
     store    = game["store"]
     meta     = STORE_META[store]
     is_ftk   = game.get("is_free_to_keep", False)
     discount = game["discount"]
     title    = game["title"]
-
+    deal_type = detect_deal_type(game)
+    deal_emoji = get_deal_emoji(deal_type)
+    deal_label = get_deal_label(deal_type)
+    
     raw_desc = game.get("description") or "No description available."
     raw_desc = BeautifulSoup(raw_desc, "html.parser").get_text()
     desc     = raw_desc[:260].rstrip() + ("…" if len(raw_desc) > 260 else "")
-
+    
     rev_pct   = game.get("review_pct")
     rev_count = game.get("review_count")
     rev_desc  = game.get("review_desc", "")
     metacritic = game.get("metacritic")
-
+    
     if rev_pct is not None and rev_count:
         mood = "🟢" if rev_pct >= 80 else ("🟡" if rev_pct >= 60 else "🔴")
         if store == "steam":
@@ -1643,27 +1785,23 @@ def build_caption(game: dict, end_date: str) -> str:
                 review_line += f"  |  Metacritic: <b>{metacritic}</b>"
     else:
         review_line = None
-
+    
     genres    = game.get("genres") or []
     genre_str = ", ".join(genres[:4]) if genres else None
-
+    
     orig  = game.get("price_orig_fmt", "")
     final = game.get("price_final_fmt", "")
-
+    
     if discount == 100:
         price_block = f"<s>{orig}</s> → <b>FREE</b>" if orig else "<b>FREE</b>"
-        disc_block  = (
-            "100% OFF 🎁 <b>Free to Keep!</b>"
-            if is_ftk else
-            "100% OFF 🎁 <b>Now free!</b>"
-        )
+        disc_block  = f"{deal_emoji} {deal_label}"
     else:
         price_block = (
             f"<s>{orig}</s> → <b>{final}</b>"
             if orig and final else (final or orig or "?")
         )
         disc_block = f"<b>-{discount}%</b> 🔥"
-
+    
     tags = ["#FreeGamesHub", meta["tag"]]
     for g in genres[:2]:
         tag = re.sub(r'[^a-zA-Z0-9]', '', g)
@@ -1677,50 +1815,67 @@ def build_caption(game: dict, end_date: str) -> str:
         tags.append("#BigDeal")
     if discount >= 90:
         tags.append("#MegaDeal")
+    if game.get("is_aaa", False):
+        tags.append("#AAA")
     hashtags = " ".join(tags)
-
+    
     now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-
+    
     lines = [
         f"{meta['emoji']} <b>[{meta['name']}]</b>  🎮 <b>{title}</b>",
         "",
     ]
-
+    
     if genre_str:
         lines += [f"🎯 <b>Genre:</b> {genre_str}", ""]
-
+    
     if desc and desc != "No description available.":
         lines += ["📝 <b>About:</b>", desc, ""]
-
+    
     if review_line:
         label = "Steam Reviews" if store == "steam" else "Rating"
         lines += [f"⭐ <b>{label}:</b> {review_line}", ""]
-
+    
     lines += [
         f"💰 <b>Price:</b> {price_block}",
         f"💸 <b>Discount:</b> {disc_block}",
         "",
+    ]
+    
+    # ─── تقویم تخفیف ─────────────────────────────────────────
+    if start_date or end_date:
+        lines += ["📅 <b>Offer Calendar:</b>", ""]
+        if start_date:
+            formatted_start = format_date_persian_english(start_date)
+            lines += [f"  🟢 <b>Start:</b> {formatted_start}", ""]
+        if end_date:
+            formatted_end = format_date_persian_english(end_date)
+            lines += [f"  🔴 <b>End:</b> {formatted_end}", ""]
+    
+    lines += [
         f"📅 <b>Detected:</b> {now_utc} UTC",
-        f"⏳ <b>Offer ends:</b> {end_date}",
         "",
         f"🔗 {game['link']}",
         "",
         hashtags,
     ]
-
+    
     caption = "\n".join(lines)
-
+    
     if len(caption) > 1024:
         short = raw_desc[:80].rstrip() + "…"
         new_lines = []
         for line in lines:
-            new_lines.append(short if line == desc else line)
+            if line.startswith("📝 <b>About:</b>"):
+                new_lines.append(f"📝 <b>About:</b> {short}")
+                continue
+            new_lines.append(line)
         caption = "\n".join(new_lines)
-
+    
     if len(caption) > 1024:
         new_lines, skip = [], False
         for line in lines:
-            if line == "📝 <b>About:</b>":
+            if line.startswith("📝 <b>About:</b>"):
                 skip = True
                 continue
             if skip and line == "":
@@ -1729,7 +1884,7 @@ def build_caption(game: dict, end_date: str) -> str:
             if not skip:
                 new_lines.append(line)
         caption = "\n".join(new_lines)[:1024]
-
+    
     return caption
 
 # ═══════════════════════════════════════════════════
@@ -1739,7 +1894,7 @@ def send_game(game: dict, caption: str) -> bool:
     url        = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     candidates = get_image_candidates(game)
     candidates = [c for c in candidates if c]
-
+    
     for img in candidates:
         try:
             r = requests.post(url, data={
@@ -1764,7 +1919,7 @@ def send_game(game: dict, caption: str) -> bool:
                 continue
         except Exception as e:
             log.error(f"Send exception: {e}")
-
+    
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -1775,7 +1930,7 @@ def send_game(game: dict, caption: str) -> bool:
             return True
     except Exception as e:
         log.error(f"sendMessage fallback failed: {e}")
-
+    
     return False
 
 # ═══════════════════════════════════════════════════
@@ -1786,10 +1941,40 @@ def process_game(game: dict) -> tuple[str, str]:
     gid    = game["id"]
     title  = game["title"]
     is_ftk = game.get("is_free_to_keep", False)
-
+    
     if is_recently_sent_cached(store, gid):
         return "skipped", "sent within last 24 hours (cache)"
-
+    
+    # ─── فیلتر بازی‌های Free to Play ──────────────────────────
+    if game.get("is_free_to_play", False):
+        return "invalid", "Free to Play (permanent)"
+    
+    # بررسی از طریق Steam (برای بازی‌هایی که از قبل علامت‌گذاری نشده‌اند)
+    if store == "steam" and gid.isdigit():
+        if steam_is_free_to_play(gid):
+            return "invalid", "Free to Play (permanent)"
+    
+    # ─── استخراج تاریخ‌ها ──────────────────────────────────────
+    start_date = game.get("deal_start", "")
+    end_date = game.get("deal_end", "")
+    period_anchor = ""
+    
+    if store == "steam" and gid.isdigit():
+        start_date, end_date, period_anchor = steam_get_promo_info(gid, is_ftk)
+    elif store == "epic":
+        start_date, end_date, period_anchor = epic_get_promo_info(game)
+    elif store == "gog":
+        start_date, end_date, period_anchor = gog_get_promo_info(game)
+    elif store == "playstation":
+        start_date, end_date, period_anchor = playstation_get_promo_info(game)
+    elif store in ["playstation_essential", "playstation_extra"]:
+        period_anchor = f"MONTH:{datetime.datetime.utcnow().strftime('%Y-%m')}"
+    elif store == "xbox_gamepass":
+        period_anchor = f"GAMEPASS:{datetime.datetime.utcnow().strftime('%Y-%m')}"
+    else:
+        period_anchor = current_week_anchor()
+    
+    # ─── تکمیل اطلاعات ──────────────────────────────────────────
     if store == "steam":
         details = steam_get_details(gid)
         if not details:
@@ -1814,50 +1999,35 @@ def process_game(game: dict) -> tuple[str, str]:
         game["review_pct"]   = rev_pct
         game["review_count"] = rev_count
         game["review_desc"]  = rev_desc
-        end_display, period_anchor = steam_get_promo_info(gid, is_ftk)
-
+        if details.get("is_free", False):
+            game["is_free_to_play"] = True
+            return "invalid", "Free to Play (permanent)"
+    
     elif store == "epic":
         enrich_epic_gog(game)
         if not game.get("genres") or not game.get("description"):
             enrich_from_steam(game)
-        end_display, period_anchor = epic_get_promo_info(game)
-
+        # Epic معمولاً Free to Keep است، نه Free to Play
+    
     elif store == "gog":
         enrich_epic_gog(game)
         if not game.get("genres") or not game.get("description"):
             enrich_from_steam(game)
-        end_display, period_anchor = gog_get_promo_info(game)
-
+    
     elif store == "playstation":
         enrich_from_steam(game)
         if not game.get("genres") or not game.get("description"):
             enrich_from_metacritic(game)
-        end_display, period_anchor = playstation_get_promo_info(game)
-
-    elif store == "playstation_essential":
+    
+    elif store in ["playstation_essential", "playstation_extra"]:
         enrich_from_steam(game)
         if not game.get("genres") or not game.get("description"):
             enrich_from_metacritic(game)
         if not game.get("genres"):
             game["genres"] = ["Action", "Adventure"]
         if not game.get("description"):
-            game["description"] = f"🎮 {game['title']} is FREE with PS Plus Essential this month!"
-        end_display = "End of month"
-        period_anchor = f"MONTH:{datetime.datetime.utcnow().strftime('%Y-%m')}"
-
-    elif store == "playstation_extra":
-        enrich_from_steam(game)
-        if not game.get("genres") or not game.get("description"):
-            enrich_from_metacritic(game)
-        if not game.get("genres"):
-            game["genres"] = ["Action", "Adventure"]
-        if not game.get("description"):
-            game["description"] = f"🎮 {game['title']} is included in PS Plus Extra!"
-        if is_recently_sent_db(store, gid, days=365):
-            return "skipped", "sent within last year"
-        end_display = "Included in Extra"
-        period_anchor = f"EXTRA:{datetime.datetime.utcnow().strftime('%Y-%m')}"
-
+            game["description"] = f"🎮 {game['title']} is included in PS Plus!"
+    
     elif store == "xbox_gamepass":
         enrich_from_steam(game)
         if not game.get("genres") or not game.get("description"):
@@ -1865,34 +2035,46 @@ def process_game(game: dict) -> tuple[str, str]:
         if not game.get("genres"):
             game["genres"] = ["Action", "Adventure"]
         if not game.get("description"):
-            game["description"] = f"🎮 {game['title']} is available on Xbox Game Pass. Experience this amazing game with your Game Pass subscription!"
+            game["description"] = f"🎮 {game['title']} is available on Xbox Game Pass!"
         if not game.get("review_pct"):
             game["review_pct"] = 85
             game["review_count"] = 5000
             game["review_desc"] = "Highly Rated"
         if is_recently_sent_db(store, gid, days=365):
             return "skipped", "sent within last year"
-        end_display = "Included in Game Pass"
-        period_anchor = f"GAMEPASS:{datetime.datetime.utcnow().strftime('%Y-%m')}"
-
+    
     else:
         return "failed", f"unknown store {store}"
-
+    
+    # ─── تشخیص AAA ──────────────────────────────────────────────
+    is_aaa = is_aaa_game_metacritic(game["title"])
+    game["is_aaa"] = is_aaa
+    
+    # ─── محاسبه Priority Score ──────────────────────────────────
+    priority_score = calculate_priority_score(game)
+    game["priority_score"] = priority_score
+    
+    # ─── تشخیص نوع تخفیف ────────────────────────────────────────
+    deal_type = detect_deal_type(game)
+    game["deal_type"] = deal_type
+    
+    # ─── Dedup ──────────────────────────────────────────────────
     deal_hash = game.get("deal_hash", "")
     if not deal_hash:
         deal_hash = get_deal_hash(game)
     if not deal_hash:
         deal_hash = make_promo_key(store, gid, period_anchor)
-
+    
     if not is_deal_changed(store, gid, deal_hash):
         return "skipped", "no change in deal"
-
+    
     if is_sent(store, gid, deal_hash):
         return "skipped", "already sent this deal"
-
-    caption = build_caption(game, end_display)
-    ok      = send_game(game, caption)
-
+    
+    # ─── ساخت کپشن و ارسال ──────────────────────────────────────
+    caption = build_caption(game, start_date, end_date)
+    ok = send_game(game, caption)
+    
     if ok:
         mark_sent(store, gid, title, deal_hash)
         mark_sent_cached(store, gid)
@@ -1901,115 +2083,125 @@ def process_game(game: dict) -> tuple[str, str]:
         return "failed", "telegram send error"
 
 # ═══════════════════════════════════════════════════
-#  MAIN — با ارسال چرخشی (PC → PS → Xbox)
+#  MAIN — با ارسال چرخشی و اولویت‌بندی
 # ═══════════════════════════════════════════════════
 
 def main():
     log.info("═" * 65)
     log.info("  🎮 FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox")
     log.info("═" * 65)
-
+    
     if not BOT_TOKEN or not CHANNEL:
         log.error("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL not set")
         return
-
+    
     if not RAWG_API_KEY:
         log.warning("⚠️  RAWG_API_KEY not set — some stores may lack genre/description")
-
+    
+    if not JDT_AVAILABLE:
+        log.warning("⚠️  jdatetime not installed — Persian dates will not be shown. Install with: pip install jdatetime")
+    
     init_db()
-
+    
     all_games = []
-
+    
     log.info("── Fetching Steam ──────────────────────────────────────")
     steam_games = fetch_steam_games()
     _merge(all_games, steam_games)
-
+    
     log.info("── Fetching Epic ───────────────────────────────────────")
     epic_games = fetch_epic_games()
     _merge(all_games, epic_games)
-
+    
     log.info("── Fetching GOG ────────────────────────────────────────")
     gog_games = fetch_gog_games()
     _merge(all_games, gog_games)
-
+    
     log.info("── Fetching PlayStation Deals ─────────────────────────")
     ps_deals = fetch_playstation_deals()
     _merge(all_games, ps_deals)
-
+    
     log.info("── Fetching PS Plus Essential ─────────────────────────")
     ps_essential = fetch_playstation_plus_essential()
     _merge(all_games, ps_essential)
-
+    
     log.info("── Fetching PS Plus Extra ─────────────────────────────")
     ps_extra = fetch_playstation_plus_extra()
     _merge(all_games, ps_extra)
-
+    
     log.info("── Fetching Xbox Game Pass ────────────────────────────")
     xbox_games = fetch_xbox_gamepass()
     _merge(all_games, xbox_games)
-
-    log.info(f"Total unique deals: {len(all_games)}")
-
+    
+    log.info(f"Total unique deals before filtering: {len(all_games)}")
+    
+    # ─── فیلتر بازی‌های Free to Play ──────────────────────────
+    filtered_games = []
+    for g in all_games:
+        if g.get("is_free_to_play", False):
+            log.debug(f"  ⏭️ Filtered Free to Play: {g['title']}")
+            continue
+        # بررسی از طریق Steam (برای مواردی که قبلاً علامت‌گذاری نشده)
+        if g["store"] == "steam" and g["id"].isdigit():
+            if steam_is_free_to_play(g["id"]):
+                log.debug(f"  ⏭️ Filtered Free to Play (Steam): {g['title']}")
+                continue
+        filtered_games.append(g)
+    
+    all_games = filtered_games
+    log.info(f"Total after filtering Free to Play: {len(all_games)}")
+    
     if not all_games:
         log.warning("No games found — exiting")
         return
-
-    # ─── مرتب‌سازی اولیه ──────────────────────────────────────────
-    # اولویت: FTK > 100% > تخفیف بیشتر
-    all_games.sort(key=lambda x: (
-        x.get("is_free_to_keep", False),
-        x["discount"] == 100,
-        x["discount"],
-    ), reverse=True)
-
+    
+    # ─── محاسبه Priority Score برای همه بازی‌ها ──────────────────
+    for g in all_games:
+        calculate_priority_score(g)
+    
     # ─── گروه‌بندی بر اساس فروشگاه ──────────────────────────────
     pc_stores = ["steam", "epic", "gog"]
     ps_stores = ["playstation", "playstation_essential", "playstation_extra"]
     xbox_stores = ["xbox_gamepass"]
-
+    
     pc_games = [g for g in all_games if g["store"] in pc_stores]
     ps_games = [g for g in all_games if g["store"] in ps_stores]
     xbox_games_filtered = [g for g in all_games if g["store"] in xbox_stores]
-
-    # ─── مرتب‌سازی هر گروه (FTK اول) ─────────────────────────────
-    pc_games.sort(key=lambda x: (not x.get("is_free_to_keep", False), -x["discount"]))
-    ps_games.sort(key=lambda x: (not x.get("is_free_to_keep", False), -x["discount"]))
-    xbox_games_filtered.sort(key=lambda x: (not x.get("is_free_to_keep", False), -x["discount"]))
-
+    
+    # ─── مرتب‌سازی هر گروه بر اساس Priority Score ──────────────
+    pc_games.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
+    ps_games.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
+    xbox_games_filtered.sort(key=lambda x: x.get("priority_score", 0), reverse=True)
+    
     log.info(f"  📊 Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_filtered)}")
-
+    
     # ─── ارسال چرخشی (Round-Robin) ──────────────────────────────
-    # PC → PS → Xbox → PC → PS → Xbox → ...
     groups = [
         ("PC", pc_games),
         ("PS", ps_games),
         ("Xbox", xbox_games_filtered),
     ]
-
-    # حذف گروه‌های خالی
     groups = [(name, games) for name, games in groups if games]
-
+    
     counters = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
     total_games = sum(len(games) for _, games in groups)
     sent_count = 0
-
-    # ارسال چرخشی تا زمانی که همه بازی‌ها ارسال شوند
+    
     while sent_count < total_games:
         for group_name, games in groups:
             if not games:
                 continue
-            
-            # یک بازی از این گروه بردار
             game = games.pop(0)
             sent_count += 1
             
             store = game["store"].upper()
             label = "🎁 FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
-            log.info(f"[{sent_count:3}/{total_games}] [{group_name:<4}][{store:<5}] {game['title'][:40]:<40} | {label}")
-
+            priority = game.get("priority_score", 0)
+            log.info(f"[{sent_count:3}/{total_games}] [{group_name:<4}][{store:<5}] {game['title'][:40]:<40} | {label} | Score:{priority}")
+            
             status, reason = process_game(game)
             counters[status] = counters.get(status, 0) + 1
-
+            
             if status == "sent":
                 log.info("       ✅ Sent")
             elif status == "skipped":
@@ -2018,9 +2210,9 @@ def main():
                 log.info(f"       ⚠️  Invalid — {reason}")
             else:
                 log.error(f"       ❌ Failed — {reason}")
-
-            time.sleep(3)  # تأخیر بین ارسال‌ها
-
+            
+            time.sleep(3)
+    
     log.info("═" * 65)
     log.info(f"  ✅ Sent:    {counters['sent']}")
     log.info(f"  ⏭  Skipped: {counters['skipped']}")
