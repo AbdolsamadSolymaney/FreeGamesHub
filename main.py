@@ -21,6 +21,7 @@ import sqlite3
 import datetime
 import re
 import json
+from typing import List, Dict, Any, Optional
 from bs4 import BeautifulSoup
 import cloudscraper
 import feedparser
@@ -253,9 +254,9 @@ class SmartSelector:
         self.page_type = page_type
         self.cache_key = f"{store}_{page_type}"
         self.selector_cache = load_selector_cache()
-        self._used_selectors = {}  # برای ذخیره سلکتورهای موفق در این جلسه
+        self._used_selectors = {}
         
-    def find_element(self, target: str, parent=None, fallback_selectors: List[str] = None):
+    def find_element(self, target: str, parent=None, fallback_selectors: list = None):
         """
         پیدا کردن یک المان با چندین روش
         target: 'title', 'price', 'discount', 'image', 'link', 'game_card'
@@ -285,7 +286,6 @@ class SmartSelector:
             try:
                 result = soup_target.select_one(selector)
                 if result:
-                    # ذخیره در کش برای دفعات بعد
                     self._save_successful_selector(target, selector)
                     return result
             except:
@@ -298,7 +298,7 @@ class SmartSelector:
         
         return None
     
-    def find_elements(self, target: str, parent=None, fallback_selectors: List[str] = None) -> List[Any]:
+    def find_elements(self, target: str, parent=None, fallback_selectors: list = None) -> list:
         """پیدا کردن چند المان (مثل لیست بازی‌ها)"""
         soup_target = parent if parent else self.soup
         
