@@ -1,37 +1,29 @@
-name: FreeGamesHub
+name: run-bot
 
 on:
-  workflow_dispatch:          # اجرای دستی از دکمه
   schedule:
-    - cron: "0 */12 * * *"   # هر ۱۲ ساعت یکبار (ساعت ۰۰ و ۱۲)
-
-# دسترسی‌های لازم برای GitHub Models
-permissions:
-  contents: read
-  models: read                # این خط برای AI بسیار مهم است
+    - cron: '0 */12 * * *'   # هر ۱۲ ساعت
+  workflow_dispatch:           # اجرای دستی هم ممکن باشه
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install Dependencies
-        run: |
-          pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # این خط اضافه شد
-        run: |
-          python main.py
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python main.py
