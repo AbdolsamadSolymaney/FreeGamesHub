@@ -11,6 +11,11 @@ FreeGamesHub — Steam + Epic Games Store + GOG
   Steam  → تخفیف ≥90% + Free to Keep
   Epic   → فقط بازی‌های رایگان هفتگی (Free Games)
   GOG    → تخفیف ≥90% + GOG Free Games
+
+تغییرات:
+  [1] تصویر استاندارد 616x353 برای همه فروشگاه‌ها
+  [2] RAWG API برای Genre + Description + Rating  (Epic + GOG)
+  [3] ساختار caption یکسان برای همه فروشگاه‌ها
 """
 
 import os
@@ -39,6 +44,8 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
+# [2] RAWG API — از https://rawg.io/apidocs کلید رایگان بگیر
+RAWG_API_KEY = os.environ.get("RAWG_API_KEY", "")
 DB_FILE      = "games.db"
 MIN_DISCOUNT = 90
 
@@ -137,6 +144,132 @@ def safe_get(url, params=None, retries=3, delay=2, use_scraper=False, extra_head
     return None
 
 # ═══════════════════════════════════════════════════
+#  [2] RAWG API — Genre + Description + Rating
+#      فقط برای Epic و GOG استفاده می‌شه
+# ═══════════════════════════════════════════════════
+_rawg_cache: dict = {}
+
+def rawg_search(title: str) -> dict | None:
+    """
+    جستجو در RAWG برای یه بازی.
+    برمی‌گردونه: {genres, description, rating_pct, ratings_count, metacritic, background_image}
+    یا None اگه پیدا نشه / match کافی نباشه.
+    """
+    cache_key = title.lower().strip()
+    if cache_key in _rawg_cache:
+        return _rawg_cache[cache_key]
+
+    # پاکسازی عنوان برای جستجوی دقیق‌تر
+    clean = re.sub(r"[™®©]", "", title).strip()
+    clean = re.sub(r"\s*[\(\[\{].*?[\)\]\}]", "", clean).strip()
+
+    params = {"search": clean, "page_size": 5}
+    if RAWG_API_KEY:
+        params["key"] = RAWG_API_KEY
+
+    r = safe_get(
+        "https://api.rawg.io/api/games",
+        params=params,
+        extra_headers={"Referer": "https://rawg.io/"},
+    )
+    if not r:
+        _rawg_cache[cache_key] = None
+        return None
+
+    try:
+        results = r.json().get("results", [])
+        if not results:
+            _rawg_cache[cache_key] = None
+            return None
+
+        # پیدا کردن بهترین match
+        best       = None
+        best_score = 0
+        title_low  = clean.lower()
+        for item in results:
+            name = item.get("name", "").lower()
+            if name == title_low:
+                score = 100
+            elif title_low in name or name in title_low:
+                score = 80
+            else:
+                t_words = set(title_low.split())
+                i_words = set(name.split())
+                score   = len(t_words & i_words) / max(len(t_words), 1) * 60
+            if score > best_score:
+                best_score = score
+                best = item
+
+        if best_score < 40 or not best:
+            log.debug(f"RAWG: no good match for '{title}' (best={best_score:.0f})")
+            _rawg_cache[cache_key] = None
+            return None
+
+        # جزئیات کامل (description)
+        description = ""
+        detail_params = {"key": RAWG_API_KEY} if RAWG_API_KEY else {}
+        dr = safe_get(
+            f"https://api.rawg.io/api/games/{best['id']}",
+            params=detail_params,
+            extra_headers={"Referer": "https://rawg.io/"},
+        )
+        if dr:
+            raw_desc = dr.json().get("description", "") or dr.json().get("description_raw", "")
+            if raw_desc:
+                description = BeautifulSoup(raw_desc, "html.parser").get_text().strip()
+                description = re.sub(r'\n{3,}', '\n\n', description)
+
+        genres       = [g["name"] for g in best.get("genres", [])]
+        rawg_rating  = best.get("rating", 0)          # 0-5
+        rating_count = best.get("ratings_count", 0)
+        rating_pct   = round(rawg_rating / 5 * 100) if rawg_rating else None
+        metacritic   = best.get("metacritic")
+        bg_image     = best.get("background_image", "") or ""
+
+        result = {
+            "genres":           genres,
+            "description":      description,
+            "rating_pct":       rating_pct,
+            "ratings_count":    rating_count,
+            "metacritic":       metacritic,
+            "rawg_rating":      rawg_rating,
+            "background_image": bg_image,
+        }
+        _rawg_cache[cache_key] = result
+        log.info(f"  🎲 RAWG match: '{title}' → '{best.get('name')}' (score={best_score:.0f})")
+        return result
+
+    except Exception as e:
+        log.error(f"RAWG error for '{title}': {e}")
+        _rawg_cache[cache_key] = None
+        return None
+
+
+def enrich_epic_gog(game: dict):
+    """Genre + Description + Rating رو از RAWG به بازی اضافه می‌کنه."""
+    rawg = rawg_search(game["title"])
+    if not rawg:
+        return
+
+    if not game.get("genres") and rawg.get("genres"):
+        game["genres"] = rawg["genres"]
+
+    if not game.get("description") and rawg.get("description"):
+        game["description"] = rawg["description"]
+
+    if rawg.get("rating_pct") and rawg.get("ratings_count", 0) > 50:
+        game["review_pct"]   = rawg["rating_pct"]
+        game["review_count"] = rawg["ratings_count"]
+        game["review_desc"]  = f"RAWG {rawg['rawg_rating']:.1f}/5"
+
+    if rawg.get("metacritic"):
+        game["metacritic"] = rawg["metacritic"]
+
+    # تصویر استاندارد از RAWG (16:9) اگه تصویر فعلی کیفیت پایین‌تری داره
+    if rawg.get("background_image"):
+        game["rawg_image"] = rawg["background_image"]
+
+# ═══════════════════════════════════════════════════
 #  GAME OBJECT FACTORY
 # ═══════════════════════════════════════════════════
 def _should_skip(title: str) -> bool:
@@ -163,6 +296,9 @@ def make_game(store: str, game_id: str, title: str, discount: int,
         "review_pct":       review_pct,
         "review_count":     review_count,
         "review_desc":      review_desc,
+        # فیلدهای اضافه برای Epic/GOG
+        "metacritic":       None,
+        "rawg_image":       "",
     }
 
 def _merge(base: list, new_items: list):
@@ -172,6 +308,34 @@ def _merge(base: list, new_items: list):
         if key not in seen:
             base.append(g)
             seen.add(key)
+
+# ═══════════════════════════════════════════════════
+#  [1] IMAGE URL — استاندارد 616×353 برای همه
+# ═══════════════════════════════════════════════════
+def get_image_candidates(game: dict) -> list[str]:
+    """
+    لیست URL تصویر از بهترین به بدترین.
+    Steam: capsule_616x353 (همون ابعاد دقیق)
+    Epic/GOG: RAWG background_image → تصویر اصلی فروشگاه
+    """
+    store = game["store"]
+    gid   = game["id"]
+
+    if store == "steam":
+        return [
+            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{gid}/capsule_616x353.jpg",
+            f"https://cdn.akamai.steamstatic.com/steam/apps/{gid}/capsule_616x353.jpg",
+            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{gid}/header.jpg",
+            f"https://cdn.akamai.steamstatic.com/steam/apps/{gid}/header.jpg",
+        ]
+    else:
+        # Epic و GOG: اول RAWG (معمولاً 16:9 با کیفیت بالا)، بعد تصویر خود فروشگاه
+        candidates = []
+        if game.get("rawg_image"):
+            candidates.append(game["rawg_image"])
+        if game.get("image_url"):
+            candidates.append(game["image_url"])
+        return candidates
 
 # ═══════════════════════════════════════════════════
 #  ██████╗ STEAM SOURCES
@@ -202,7 +366,7 @@ def _steam_fetch_featured() -> list[dict]:
                 f"https://store.steampowered.com/app/{appid}/",
                 f"${orig/100:.2f}" if orig else "",
                 f"${final/100:.2f}" if final else "",
-                f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg",
+                f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
             ))
         for section in ["top_sellers", "new_releases"]:
             for item in data.get(section, {}).get("items", []):
@@ -220,7 +384,7 @@ def _steam_fetch_featured() -> list[dict]:
                     f"https://store.steampowered.com/app/{appid}/",
                     f"${orig/100:.2f}" if orig else "",
                     f"${final/100:.2f}" if final else "",
-                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg",
+                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
                 ))
     except Exception as e:
         log.error(f"Steam Featured parse error: {e}")
@@ -266,7 +430,7 @@ def _steam_fetch_html_search() -> list[dict]:
                     f"https://store.steampowered.com/app/{appid}/",
                     orig_el.text.strip() if orig_el else "",
                     final_el.text.strip() if final_el else "",
-                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg",
+                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
                 ))
             except Exception as e:
                 log.debug(f"Steam HTML row parse error: {e}")
@@ -300,7 +464,7 @@ def _steam_fetch_free_to_keep() -> list[dict]:
                     "steam", appid, title, 100,
                     f"https://store.steampowered.com/app/{appid}/",
                     final_fmt="FREE",
-                    image_url=f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg",
+                    image_url=f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
                     is_free_to_keep=True,
                 ))
                 log.info(f"  🎁 Steam FTK (JSON): {title}")
@@ -335,7 +499,7 @@ def _steam_fetch_free_to_keep() -> list[dict]:
                         "steam", appid, title, 100,
                         f"https://store.steampowered.com/app/{appid}/",
                         final_fmt="FREE",
-                        image_url=f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg",
+                        image_url=f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
                         is_free_to_keep=True,
                     ))
                     log.info(f"  🎁 Steam FTK (HTML): {title}")
@@ -466,7 +630,7 @@ def fetch_epic_games() -> list[dict]:
                 continue
 
             # فقط بازی‌های رایگان فعلی (نه upcoming)
-            promotions = el.get("promotions") or {}
+            promotions   = el.get("promotions") or {}
             promo_offers = promotions.get("promotionalOffers", [])
             if not promo_offers:
                 continue
@@ -497,11 +661,14 @@ def fetch_epic_games() -> list[dict]:
             orig_cents  = total_price.get("originalPrice", 0)
             orig_fmt    = f"${orig_cents/100:.2f}" if orig_cents else ""
 
-            # تصویر
+            # [1] تصویر — OfferImageWide اولویت داره (نزدیک‌ترین به 16:9)
             image_url = ""
-            for img in el.get("keyImages", []):
-                if img.get("type") in ("DieselStoreFrontWide", "OfferImageWide", "Thumbnail"):
-                    image_url = img.get("url", "")
+            for img_type in ("OfferImageWide", "DieselStoreFrontWide", "Thumbnail"):
+                for img in el.get("keyImages", []):
+                    if img.get("type") == img_type:
+                        image_url = img.get("url", "")
+                        break
+                if image_url:
                     break
 
             # لینک
@@ -740,7 +907,7 @@ def gog_get_promo_info(game: dict) -> tuple[str, str]:
     return "Unknown", f"{prefix}{week}"
 
 # ═══════════════════════════════════════════════════
-#  CAPTION BUILDER (multi-store)
+#  [3] CAPTION BUILDER — ساختار یکسان برای همه
 # ═══════════════════════════════════════════════════
 def build_caption(game: dict, end_date: str) -> str:
     store    = game["store"]
@@ -754,19 +921,28 @@ def build_caption(game: dict, end_date: str) -> str:
     raw_desc = BeautifulSoup(raw_desc, "html.parser").get_text()
     desc     = raw_desc[:260].rstrip() + ("…" if len(raw_desc) > 260 else "")
 
-    # نقدها (Steam)
+    # نقدها
+    # Steam → درصد + تعداد + label
+    # Epic/GOG → RAWG rating + Metacritic (اگه موجود بود)
     rev_pct   = game.get("review_pct")
     rev_count = game.get("review_count")
     rev_desc  = game.get("review_desc", "")
+    metacritic = game.get("metacritic")
+
     if rev_pct is not None and rev_count:
-        mood        = "🟢" if rev_pct >= 80 else ("🟡" if rev_pct >= 60 else "🔴")
-        review_line = f"{mood} <b>{rev_pct}%</b> from {rev_count:,} reviews — {rev_desc}"
+        mood = "🟢" if rev_pct >= 80 else ("🟡" if rev_pct >= 60 else "🔴")
+        if store == "steam":
+            review_line = f"{mood} <b>{rev_pct}%</b> from {rev_count:,} reviews — {rev_desc}"
+        else:
+            review_line = f"{mood} <b>{rev_pct}%</b> from {rev_count:,} RAWG ratings"
+            if metacritic:
+                review_line += f"  |  Metacritic: <b>{metacritic}</b>"
     else:
         review_line = None
 
-    # ژانر (Steam)
+    # ژانر
     genres    = game.get("genres") or []
-    genre_str = ", ".join(genres) if genres else None
+    genre_str = ", ".join(genres[:4]) if genres else None
 
     # قیمت
     orig  = game.get("price_orig_fmt", "")
@@ -802,6 +978,7 @@ def build_caption(game: dict, end_date: str) -> str:
 
     now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
+    # ═══ ساختار ثابت — همه فروشگاه‌ها ═══
     lines = [
         f"{meta['emoji']} <b>[{meta['name']}]</b>  🎮 <b>{title}</b>",
         "",
@@ -814,7 +991,8 @@ def build_caption(game: dict, end_date: str) -> str:
         lines += ["📝 <b>About:</b>", desc, ""]
 
     if review_line:
-        lines += [f"⭐ <b>Steam Reviews:</b> {review_line}", ""]
+        label = "Steam Reviews" if store == "steam" else "Rating"
+        lines += [f"⭐ <b>{label}:</b> {review_line}", ""]
 
     lines += [
         f"💰 <b>Price:</b> {price_block}",
@@ -858,21 +1036,9 @@ def build_caption(game: dict, end_date: str) -> str:
 #  TELEGRAM SENDER
 # ═══════════════════════════════════════════════════
 def send_game(game: dict, caption: str) -> bool:
-    store    = game["store"]
-    appid    = game["id"]
-    url      = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-
-    # لیست تصاویر بر اساس فروشگاه
-    if store == "steam":
-        candidates = [
-            game.get("image_url", ""),
-            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg",
-            f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg",
-            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
-        ]
-    else:
-        candidates = [game.get("image_url", "")]
-
+    url        = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    # [1] از get_image_candidates استفاده می‌کنیم به جای لیست ثابت
+    candidates = get_image_candidates(game)
     candidates = [c for c in candidates if c]
 
     for img in candidates:
@@ -963,9 +1129,13 @@ def process_game(game: dict) -> tuple[str, str]:
         end_display, period_anchor = steam_get_promo_info(gid, is_ftk)
 
     elif store == "epic":
+        # [2] RAWG enrichment برای Epic
+        enrich_epic_gog(game)
         end_display, period_anchor = epic_get_promo_info(game)
 
     elif store == "gog":
+        # [2] RAWG enrichment برای GOG
+        enrich_epic_gog(game)
         end_display, period_anchor = gog_get_promo_info(game)
 
     else:
@@ -999,6 +1169,9 @@ def main():
     if not BOT_TOKEN or not CHANNEL:
         log.error("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL not set")
         return
+
+    if not RAWG_API_KEY:
+        log.warning("⚠️  RAWG_API_KEY not set — Epic/GOG may have no genre/description")
 
     init_db()
 
