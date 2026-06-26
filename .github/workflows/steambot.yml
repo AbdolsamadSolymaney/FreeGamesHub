@@ -26,5 +26,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
         run: |
           python main.py
