@@ -1,13 +1,12 @@
 """
 FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-نسخه نهایی با AI Decision Engine (تصمیم‌گیری کاملاً خودکار)
-- AI با GitHub Models تصمیم‌گیری می‌کند (Consensus با ۳ بار بررسی)
-- Smart Selector برای مقاومت در برابر تغییرات ساختار فروشگاه‌ها
-- نمایش تاریخ شمسی و میلادی
-- فیلتر بازی‌های Free to Play
-- Priority Score برای اولویت‌بندی ارسال
-- ارسال چرخشی PC → PS → Xbox
+نسخه نهایی با AI Decision Engine و تمام اصلاحات
+- AI با GitHub Models (آدرس api.github.com)
+- پرامپت دقیق و کامل برای AI
+- نمایش تاریخ شمسی و میلادی با پشتیبانی از فرمت‌های مختلف
+- Smart Selector برای مقاومت در برابر تغییرات ساختار
+- افزایش Retry برای پایداری بیشتر
 - اجرای خودکار هر ۱۲ ساعت
 """
 
@@ -205,9 +204,9 @@ def is_recently_sent_db(store: str, game_id: str, days: int = 365) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════
-#  HTTP HELPER
+#  HTTP HELPER (با افزایش Retry به ۵)
 # ═══════════════════════════════════════════════════
-def safe_get(url, params=None, retries=3, delay=2, use_scraper=False, extra_headers=None):
+def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_headers=None):
     headers = dict(HEADERS)
     if extra_headers:
         headers.update(extra_headers)
@@ -231,16 +230,15 @@ def safe_get(url, params=None, retries=3, delay=2, use_scraper=False, extra_head
     return None
 
 # ═══════════════════════════════════════════════════
-#  AI VALIDATION — تصمیم‌گیری کامل خودکار
+#  AI DECISION ENGINE
 # ═══════════════════════════════════════════════════
 
 class AIDecisionEngine:
     """
     موتور تصمیم‌گیری هوش مصنوعی
-    - بررسی کامل بازی با AI
+    - بررسی کامل بازی با AI (آدرس api.github.com)
     - Consensus با ۳ بار درخواست برای دقت ۱۰۰٪
-    - تصمیم نهایی: ارسال یا رد
-    - ذخیره تمام تصمیمات در دیتابیس
+    - پرامپت دقیق و کامل
     """
     
     def __init__(self):
@@ -256,19 +254,13 @@ class AIDecisionEngine:
             log.warning("⚠️ GITHUB_TOKEN not set — using fallback logic")
     
     def decide(self, game: Dict[str, Any]) -> Tuple[bool, str, Dict]:
-        """
-        تصمیم‌گیری درباره یک بازی
-        برمی‌گرداند: (is_valid, reason, corrected_data)
-        """
         if not self.enabled:
             return self._fallback_decision(game)
         
-        # ۱. بررسی اولیه با منطق ساده (فیلتر سریع)
         quick_check = self._quick_check(game)
         if not quick_check[0]:
             return False, quick_check[1], {}
         
-        # ۲. بررسی با AI (Consensus)
         results = []
         for i in range(self.consensus_count):
             result = self._call_ai(game)
@@ -279,23 +271,18 @@ class AIDecisionEngine:
         if not results:
             return self._fallback_decision(game)
         
-        # ۳. تحلیل نتایج Consensus
         return self._analyze_consensus(results, game)
     
     def _quick_check(self, game: dict) -> Tuple[bool, str]:
-        """بررسی سریع با منطق ساده"""
         title = game.get('title', '')
-        
         for kw in SKIP_KEYWORDS:
             if kw.lower() in title.lower():
                 return False, f"Contains '{kw}'"
-        
         if game.get('discount', 0) > 0:
             orig = game.get('price_orig_fmt', '')
             final = game.get('price_final_fmt', '')
             if orig and final and orig == final and game.get('discount', 0) > 0:
                 return False, "Price mismatch: original = final but discount > 0"
-        
         start = game.get('deal_start', '')
         end = game.get('deal_end', '')
         if start and end:
@@ -306,16 +293,13 @@ class AIDecisionEngine:
                     return False, "Start date after end date"
             except:
                 pass
-        
         return True, "Quick check passed"
     
     def _call_ai(self, game: dict) -> Optional[dict]:
-        """ارسال درخواست به AI و دریافت پاسخ"""
         prompt = self._build_prompt(game)
-        
         try:
             response = requests.post(
-                "https://models.github.com/v1/chat/completions",
+                "https://api.github.com/v1/chat/completions",  # آدرس اصلاح شده
                 headers={
                     "Authorization": f"Bearer {self.token}",
                     "Content-Type": "application/json"
@@ -331,75 +315,91 @@ class AIDecisionEngine:
                 },
                 timeout=15
             )
-            
             if response.status_code != 200:
                 log.warning(f"AI API error: {response.status_code}")
                 return None
-            
             data = response.json()
             content = data['choices'][0]['message']['content']
-            
             import re
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
             else:
                 return None
-                
         except Exception as e:
             log.error(f"AI call error: {e}")
             return None
     
     def _build_prompt(self, game: dict) -> str:
         return f"""
-You are a game deal validator. Your task is to decide if this deal is VALID and should be sent to users.
+You are an expert game deal validator AI. Your ONLY job is to analyze game deal data and decide if it's VALID and should be sent to users. You must NEVER guess or assume - base your decision ONLY on the provided data.
 
-Game Information:
-- Title: {game.get('title', 'Unknown')}
-- Store: {game.get('store', 'Unknown')}
-- Discount: {game.get('discount', 0)}%
-- Original Price: {game.get('price_orig_fmt', 'N/A')}
-- Final Price: {game.get('price_final_fmt', 'N/A')}
-- Link: {game.get('link', 'N/A')}
-- Is Free to Keep: {game.get('is_free_to_keep', False)}
-- Deal Start: {game.get('deal_start', 'N/A')}
-- Deal End: {game.get('deal_end', 'N/A')}
-- Genres: {game.get('genres', [])}
-- Metacritic: {game.get('metacritic', 'N/A')}
+=== YOUR ROLE ===
+You are a quality control system for a Telegram game deals bot. Your decision determines whether users see this deal or not. Accuracy is critical.
 
-Decision Rules:
-1. Reject if it's DLC, Soundtrack, Season Pass, or similar (title contains these)
-2. Reject if discount is inconsistent with prices
-3. Reject if deal dates are invalid (start > end)
-4. Reject if link is invalid
-5. For free games (discount 100%), check if it's really free
-6. Check if the game is a real game (not a demo, beta, etc.)
-7. Check if the game title is correct (not truncated or corrupted)
+=== DATA TO ANALYZE ===
+Game Title: {game.get('title', 'Unknown')}
+Store: {game.get('store', 'Unknown')}
+Discount: {game.get('discount', 0)}%
+Original Price: {game.get('price_orig_fmt', 'N/A')}
+Final Price: {game.get('price_final_fmt', 'N/A')}
+Link: {game.get('link', 'N/A')}
+Is Free to Keep: {game.get('is_free_to_keep', False)}
+Deal Start: {game.get('deal_start', 'N/A')}
+Deal End: {game.get('deal_end', 'N/A')}
+Genres: {game.get('genres', [])}
+Metacritic Score: {game.get('metacritic', 'N/A')}
 
-RESPOND IN JSON ONLY:
+=== VALIDATION RULES (REJECT IF ANY APPLY) ===
+1. REJECT if title contains: DLC, Soundtrack, OST, Season Pass, Expansion, Upgrade, Add-on, Artbook, Comic, Deluxe, Bundle, Content Pack, Cosmetic, Starter Pack (these are not full games)
+2. REJECT if discount is 100% but it's NOT marked as "Free to Keep" (likely a free weekend or temporary)
+3. REJECT if discount percentage is inconsistent with prices (e.g., original $60, final $60, but discount says 50%)
+4. REJECT if start date is after end date (invalid timeframe)
+5. REJECT if link is broken or doesn't contain the store domain (steam, epic, gog, playstation, xbox)
+6. REJECT if title is truncated, corrupted, or contains special characters excessively (like @#$%^&*)
+7. REJECT if the game appears to be a demo, beta, or prologue (title contains: demo, beta, prologue, trial)
+
+=== ACCEPTANCE RULES (ACCEPT IF ALL PASS) ===
+1. Game is a full title (not DLC, not add-on)
+2. Discount is valid and matches prices
+3. Dates are logical (start < end)
+4. Link is valid
+5. Title is clean and readable
+
+=== SPECIAL CASES ===
+- If discount is 100% AND Free to Keep is TRUE → ACCEPT (it's a permanent free game)
+- If discount is 100% but Free to Keep is FALSE → REJECT (it's a free weekend/temporary)
+- If Metacritic score is 90+ → prioritize ACCEPT (it's a critically acclaimed game)
+- If game is AAA (by your judgment) and discount > 50% → prioritize ACCEPT
+
+=== RESPONSE FORMAT ===
+You MUST respond in JSON format ONLY. No extra text.
+
 {{
   "decision": "accept" or "reject",
   "confidence": 0-100,
-  "reason": "short explanation",
-  "warnings": ["warning1", "warning2"],
+  "reason": "Brief explanation of your decision",
+  "warnings": ["list", "of", "any", "issues", "found"],
   "corrected_data": {{
-    "field": "corrected_value"
+    "field_name": "corrected_value"
   }}
 }}
 
-Only include fields that need correction.
+If no corrections needed, "corrected_data" should be empty {{}}.
+Confidence should be 80+ if you're certain, 50-79 if uncertain, below 50 if very uncertain.
+
+=== NOW DECIDE ===
+Analyze the game data above and respond with your decision. Be thorough and accurate.
 """
     
     def _analyze_consensus(self, results: list, original_game: dict) -> Tuple[bool, str, dict]:
         if len(results) < 2:
             return self._extract_result(results[0], original_game) if results else (False, "No AI response", {})
-        
         accept_count = 0
         reject_count = 0
         all_warnings = []
         all_corrections = {}
         confidence_sum = 0
-        
         for r in results:
             decision = r.get("decision", "reject")
             if decision == "accept":
@@ -408,15 +408,12 @@ Only include fields that need correction.
                 reject_count += 1
             confidence_sum += r.get("confidence", 0)
             all_warnings.extend(r.get("warnings", []))
-            
             corrections = r.get("corrected_data", {})
             for key, value in corrections.items():
                 if key not in all_corrections:
                     all_corrections[key] = value
-        
         avg_confidence = confidence_sum / len(results) if results else 0
         unique_warnings = list(set(all_warnings))
-        
         if accept_count > reject_count and avg_confidence >= self.confidence_threshold:
             return True, f"Accepted: {accept_count}/{len(results)} consensus", all_corrections
         elif accept_count > reject_count and avg_confidence < self.confidence_threshold:
@@ -432,7 +429,6 @@ Only include fields that need correction.
         reason = result.get("reason", "No reason provided")
         warnings = result.get("warnings", [])
         corrections = result.get("corrected_data", {})
-        
         if decision == "accept" and confidence >= self.confidence_threshold:
             return True, f"Accepted: {reason}", corrections
         else:
@@ -444,10 +440,8 @@ Only include fields that need correction.
         for kw in ["dlc", "soundtrack", "season pass", "deluxe", "bundle"]:
             if kw in title:
                 return False, f"Contains '{kw}' (fallback)", {}
-        
         if game.get('discount', 0) > 95 and not game.get('is_free_to_keep'):
             return False, "High discount but not Free to Keep (fallback)", {}
-        
         return True, "Passed fallback validation", {}
     
     def log_decision(self, game: dict, decision: str, reason: str):
@@ -466,6 +460,50 @@ Only include fields that need correction.
         ))
         conn.commit()
         conn.close()
+
+# ═══════════════════════════════════════════════════
+#  DATE FORMATTER (با پشتیبانی از فرمت‌های مختلف)
+# ═══════════════════════════════════════════════════
+def format_date_persian_english(date_str: str) -> str:
+    if not date_str:
+        return "نامشخص"
+    
+    # حذف زمان و منطقه زمانی
+    date_str_clean = date_str.split("T")[0].split(" ")[0]
+    
+    # فرمت‌های مختلف تاریخ را امتحان کن
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d %b %Y",
+        "%b %d, %Y",
+        "%d/%m/%Y",
+        "%m/%d/%Y"
+    ]
+    
+    dt = None
+    for fmt in formats:
+        try:
+            dt = datetime.datetime.strptime(date_str_clean, fmt)
+            break
+        except ValueError:
+            continue
+    
+    if dt is None:
+        return date_str
+    
+    gregorian = dt.strftime("%d %b %Y")
+    
+    if JDT_AVAILABLE and jdatetime:
+        try:
+            jd = jdatetime.datetime.fromgregorian(datetime=dt)
+            persian = jd.strftime("%Y/%m/%d")
+            return f"{persian}\n{gregorian}"
+        except Exception as e:
+            log.debug(f"jdatetime conversion error: {e}")
+            return gregorian
+    else:
+        return gregorian
 
 # ═══════════════════════════════════════════════════
 #  RAWG API
@@ -489,7 +527,7 @@ def rawg_search(title: str) -> dict | None:
         "https://api.rawg.io/api/games",
         params=params,
         extra_headers={"Referer": "https://rawg.io/"},
-        retries=2,
+        retries=3,
         delay=1
     )
     if not r:
@@ -529,7 +567,7 @@ def rawg_search(title: str) -> dict | None:
             f"https://api.rawg.io/api/games/{best['id']}",
             params=detail_params,
             extra_headers={"Referer": "https://rawg.io/"},
-            retries=2,
+            retries=3,
             delay=1
         )
         if dr:
@@ -757,27 +795,6 @@ def get_deal_label(deal_type: str, discount: int) -> str:
         return "Free to Play (کاملاً رایگان)"
     else:
         return f"{discount}% تخفیف"
-
-# ═══════════════════════════════════════════════════
-#  DATE FORMATTER
-# ═══════════════════════════════════════════════════
-def format_date_persian_english(date_str: str) -> str:
-    if not date_str:
-        return "نامشخص"
-    try:
-        if "T" in date_str:
-            dt = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(tzinfo=None)
-        else:
-            dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-        gregorian = dt.strftime("%d %b %Y")
-        if JDT_AVAILABLE and jdatetime:
-            jd = jdatetime.datetime.fromgregorian(datetime=dt)
-            persian = jd.strftime("%Y/%m/%d")
-            return f"{persian}\n{gregorian}"
-        else:
-            return gregorian
-    except Exception as e:
-        return date_str
 
 # ═══════════════════════════════════════════════════
 #  STEAM SOURCES
@@ -1193,7 +1210,7 @@ def epic_get_promo_info(game: dict) -> tuple[str, str, str]:
     return "", "", f"FTK:{current_week_anchor()}"
 
 # ═══════════════════════════════════════════════════
-#  GOG با Smart Selector
+#  GOG با Smart Selector (به‌روز شده)
 # ═══════════════════════════════════════════════════
 def fetch_gog_games() -> list[dict]:
     games = []
@@ -1848,7 +1865,12 @@ class SmartSelector:
                 "li[data-product-id]",
                 "[class*='game']",
                 ".game-item",
-                ".game-tile"
+                ".game-tile",
+                "a[href*='/product/']",
+                "a[href*='/game/']",
+                ".card",
+                ".item",
+                "[data-qa*='product']"
             ]
         }
         
@@ -1858,14 +1880,14 @@ class SmartSelector:
                 "discount": ["[data-testid='discountPercentage']", ".discount-percentage"],
                 "price_original": [".original-price", ".old-price"],
                 "price_final": [".final-price", ".current-price"],
-                "game_card_list": ["[data-testid='productCard']", ".product-tile", ".product-card"]
+                "game_card_list": ["[data-testid='productCard']", ".product-tile", ".product-card", ".card", ".item"]
             },
             "playstation": {
                 "title": ["[data-testid='product-title']", ".product-title", ".title"],
                 "discount": ["[data-testid='discount-badge']", ".discount-badge"],
                 "price_original": ["[data-testid='original-price']", ".original-price", ".price__old"],
                 "price_final": ["[data-testid='final-price']", ".final-price", ".price__current"],
-                "game_card_list": ["[data-testid='product-card']", ".product-card", ".grid-cell"]
+                "game_card_list": ["[data-testid='product-card']", ".product-card", ".grid-cell", ".card", ".item"]
             }
         }
         
