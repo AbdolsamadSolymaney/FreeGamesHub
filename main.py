@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
-RAWG_API_KEY = os.environ.get("RAWG_API_KEY", "")
+RAWG_API_KEY = os.environ.get("RAWG_API_KEY")
 DB_FILE      = "games.db"
 MIN_DISCOUNT = 75
 
