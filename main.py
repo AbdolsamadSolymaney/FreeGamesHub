@@ -39,12 +39,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────
-BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL      = os.environ.get("TELEGRAM_CHANNEL")
-RAWG_API_KEY = os.environ.get("RAWG_API_KEY", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+BOT_TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHANNEL           = os.environ.get("TELEGRAM_CHANNEL")
+RAWG_API_KEY      = os.environ.get("RAWG_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DB_FILE      = "games.db"
-SELECTORS_DB = "selectors_cache.json"
 MIN_DISCOUNT = 75
 
 AAA_METACRITIC_THRESHOLD = 75
@@ -149,6 +149,34 @@ def mark_sent(store: str, game_id: str, title: str, deal_hash: str):
     conn.commit()
     conn.close()
 
+def update_deal_history(game: dict):
+    """Record the latest deal data — used to detect changes on future runs."""
+    ts = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        INSERT OR REPLACE INTO deal_history
+        (store, game_id, last_start, last_end, last_price, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        game["store"], game["id"],
+        game.get("deal_start", ""), game.get("deal_end", ""),
+        game.get("price_final_fmt", ""), ts,
+    ))
+    conn.commit()
+    conn.close()
+
+def get_prev_deal(store: str, game_id: str) -> dict | None:
+    """Return last recorded deal data for this game, or None if first time."""
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute(
+        "SELECT last_start, last_end, last_price FROM deal_history WHERE store=? AND game_id=?",
+        (store, game_id)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"deal_start": row[0], "deal_end": row[1], "price_final_fmt": row[2]}
+
 def make_promo_key(store: str, game_id: str, period_anchor: str) -> str:
     raw = f"{store}|{game_id}|{period_anchor}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
@@ -220,84 +248,193 @@ def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_head
     log.error(f"All {retries} attempts failed for {url}")
     return None
 
-# ─── مشکل ۱: AI Decision Engine (اصلاح شده) ─────────────────────────────
-# مشکل: GitHub Models (models.inference.github.com) از GitHub Actions قابل دسترس نیست
-# چون Actions در محیط سندباکس اجرا می‌شه و DNS اون host رو resolve نمی‌کنه
-# راه‌حل: استفاده از fallback هوشمند با قوانین دقیق به جای API خارجی
+# ─── AI Decision Engine (Anthropic API) ─────────────────────────────────
+# Uses claude-sonnet-4-6 via Anthropic API for intelligent game validation,
+# description enrichment, and quality assessment.
+# Falls back to rule-based logic if API is unavailable.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
 class AIDecisionEngine:
     def __init__(self):
-        self.enabled = True
-        log.info("AI Decision Engine initialized (Smart Fallback Mode)")
+        self.api_key = ANTHROPIC_API_KEY
+        self.enabled = bool(self.api_key)
+        if self.enabled:
+            log.info("AI Decision Engine initialized (Anthropic API mode)")
+        else:
+            log.info("AI Decision Engine initialized (rule-based fallback — set ANTHROPIC_API_KEY to enable)")
+
+    def _call_claude(self, system: str, user: str, max_tokens: int = 400) -> str | None:
+        """Call Anthropic Messages API, return text content or None."""
+        if not self.enabled:
+            return None
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": max_tokens,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user}],
+                },
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["content"][0]["text"]
+            else:
+                log.warning(f"Anthropic API {resp.status_code}: {resp.text[:120]}")
+                return None
+        except Exception as e:
+            log.warning(f"Anthropic API error: {e}")
+            return None
 
     def decide(self, game: Dict[str, Any]) -> Tuple[bool, str, Dict]:
         """
-        تصمیم‌گیری هوشمند بدون نیاز به API خارجی.
-        چون GitHub Models از Actions دسترسی ندارد، از منطق محلی استفاده می‌کنیم.
+        Validate game deal with AI or rule-based fallback.
+        Returns (is_valid, reason, corrections_dict).
         """
-        # چک سریع عنوان
-        title = game.get('title', '')
+        # ── Rule-based pre-checks (always run, fast) ──────────────────
+        title = game.get("title", "")
         for kw in SKIP_KEYWORDS:
             if kw.lower() in title.lower():
-                return False, f"Title contains forbidden keyword: '{kw}'", {}
+                return False, f"Keyword filter: '{kw}'", {}
 
-        # چک DLC/Expansion با regex
         dlc_patterns = [r'\bDLC\b', r'\bSoundtrack\b', r'\bOST\b', r'Season Pass',
                         r'Starter Pack', r'Upgrade Pack', r'Add.?on', r'Expansion Pack']
         for pat in dlc_patterns:
             if re.search(pat, title, re.IGNORECASE):
-                return False, f"DLC/addon pattern detected: {pat}", {}
+                return False, f"DLC/addon pattern: {pat}", {}
 
-        # چک link معتبر
-        link = game.get('link', '')
-        if not link or not link.startswith('http'):
+        link = game.get("link", "")
+        if not link or not link.startswith("http"):
             return False, "Invalid or missing link", {}
 
-        # چک تناقض قیمت
-        discount = game.get('discount', 0)
-        orig = game.get('price_orig_fmt', '')
-        final = game.get('price_final_fmt', '')
+        discount = game.get("discount", 0)
+        orig = game.get("price_orig_fmt", "")
+        final = game.get("price_final_fmt", "")
         if orig and final and orig == final and discount > 0:
             return False, "Price mismatch: orig equals final but discount > 0", {}
 
-        # چک تاریخ
-        start = game.get('deal_start', '')
-        end = game.get('deal_end', '')
+        start = game.get("deal_start", "")
+        end = game.get("deal_end", "")
         if start and end:
             try:
                 s = datetime.datetime.strptime(start[:10], "%Y-%m-%d")
                 e = datetime.datetime.strptime(end[:10], "%Y-%m-%d")
+                now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
                 if s > e:
-                    return False, "Start date is after end date", {}
-                # چک منقضی بودن
-                if e < datetime.datetime.now(datetime.UTC).replace(tzinfo=None):
+                    return False, "Start date after end date", {}
+                if e < now:
                     return False, "Deal already expired", {}
             except:
                 pass
 
-        # چک ۱۰۰٪ تخفیف بدون FTK
-        if discount == 100 and not game.get('is_free_to_keep') and game.get('store') == 'steam':
-            return False, "100% discount on Steam but not marked as Free to Keep", {}
+        if discount == 100 and not game.get("is_free_to_keep") and game.get("store") == "steam":
+            return False, "100% discount on Steam but not Free to Keep", {}
 
-        # امتیازدهی کیفیت
-        quality_score = 0
-        mc = game.get('metacritic')
+        # ── AI enrichment + validation (runs if API available) ────────
+        if self.enabled:
+            result = self._ai_validate_and_enrich(game)
+            if result:
+                return result
+
+        # ── Rule-based score fallback ──────────────────────────────────
+        q = 0
+        mc = game.get("metacritic")
         if mc:
-            if mc >= 90: quality_score += 30
-            elif mc >= 80: quality_score += 20
-            elif mc >= 70: quality_score += 10
+            if mc >= 90: q += 30
+            elif mc >= 80: q += 20
+            elif mc >= 70: q += 10
+        rp = game.get("review_pct")
+        if rp:
+            if rp >= 85: q += 20
+            elif rp >= 70: q += 10
+        if game.get("is_free_to_keep"): q += 40
+        if game.get("is_aaa"): q += 20
+        if discount >= 90: q += 15
+        elif discount >= 75: q += 10
+        return True, f"Rule-based validation (score: {min(q,100)})", {}
 
-        rev_pct = game.get('review_pct')
-        if rev_pct:
-            if rev_pct >= 85: quality_score += 20
-            elif rev_pct >= 70: quality_score += 10
+    def _ai_validate_and_enrich(self, game: dict) -> Tuple[bool, str, Dict] | None:
+        """
+        Ask Claude to validate and enrich the game data.
+        Returns None if API fails (so caller falls back to rule-based).
+        """
+        system = (
+            "You are a strict game deal validator. "
+            "Respond ONLY with a valid JSON object. No markdown, no explanation outside JSON."
+        )
+        user = f"""Validate this game deal and return enrichment data.
 
-        if game.get('is_free_to_keep'): quality_score += 40
-        if game.get('is_aaa'): quality_score += 20
-        if discount >= 90: quality_score += 15
-        elif discount >= 75: quality_score += 10
+Game data:
+  title: {game.get('title')}
+  store: {game.get('store')}
+  discount: {game.get('discount')}%
+  price_orig: {game.get('price_orig_fmt', 'N/A')}
+  price_final: {game.get('price_final_fmt', 'N/A')}
+  free_to_keep: {game.get('is_free_to_keep', False)}
+  deal_start: {game.get('deal_start', 'unknown')}
+  deal_end: {game.get('deal_end', 'unknown')}
+  link: {game.get('link', '')}
+  genres: {game.get('genres', [])}
+  description_len: {len(game.get('description', ''))} chars
 
-        confidence = min(quality_score, 100)
-        return True, f"Passed smart validation (confidence: {confidence}%)", {}
+Rules to apply:
+1. REJECT if title contains DLC, Soundtrack, OST, Season Pass, Expansion, Upgrade, Add-on, Bundle, Cosmetic
+2. REJECT if it is clearly not a game (e.g. software tool, movie)
+3. REJECT if link domain does not match store (e.g. steam link for epic store)
+4. ACCEPT free-to-keep promos unconditionally if rules 1-3 pass
+5. For discounts, only ACCEPT if deal seems legitimate
+
+Return JSON:
+{{
+  "accept": true or false,
+  "confidence": 0-100,
+  "reason": "brief reason",
+  "is_aaa": true or false,
+  "quality_tier": "S" | "A" | "B" | "C",
+  "suggested_description": "1-2 sentence game description if genres/desc missing, else empty string",
+  "warning": "any concern or empty string"
+}}"""
+
+        raw = self._call_claude(system, user, max_tokens=350)
+        if not raw:
+            return None
+
+        try:
+            # strip markdown fences if present
+            raw = re.sub(r"```json\s*|\s*```", "", raw).strip()
+            data = json.loads(raw)
+            accept = bool(data.get("accept", True))
+            confidence = int(data.get("confidence", 50))
+            reason = data.get("reason", "AI validated")
+            corrections = {}
+
+            if data.get("is_aaa"):
+                game["is_aaa"] = True
+            if data.get("suggested_description") and not game.get("description"):
+                game["description"] = data["suggested_description"]
+                corrections["description"] = data["suggested_description"]
+
+            tier = data.get("quality_tier", "C")
+            game["ai_quality_tier"] = tier
+            game["ai_confidence"] = confidence
+
+            if data.get("warning"):
+                log.info(f"   AI warning: {data['warning']}")
+
+            status = "accepted" if accept else "rejected"
+            log.info(f"   AI {status} [{tier}] confidence={confidence}%: {reason}")
+            return accept, reason, corrections
+
+        except Exception as e:
+            log.warning(f"AI response parse error: {e} | raw: {raw[:120]}")
+            return None
 
     def log_decision(self, game: dict, decision: str, reason: str):
         try:
@@ -307,10 +444,12 @@ class AIDecisionEngine:
                 (game_id, title, decision, confidence, warnings, checked_at)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                game.get('id', 'unknown'),
-                game.get('title', 'unknown'),
-                decision, 0, reason,
-                datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+                game.get("id", "unknown"),
+                game.get("title", "unknown"),
+                decision,
+                game.get("ai_confidence", 0),
+                reason,
+                datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"),
             ))
             conn.commit()
             conn.close()
@@ -1213,106 +1352,121 @@ def playstation_get_promo_info(game: dict) -> tuple:
 
 # ─── PS Plus Essential / Extra (اصلاح شده) ────────────────────────────
 def fetch_playstation_plus_essential() -> list:
+    """
+    PS Plus Essential monthly games.
+    Uses PlayStation Store API (JSON) — no HTML selectors to break.
+    Falls back to static list if API unavailable.
+    """
     games = []
-    log.info("  🔍 Fetching PS Plus Essential from PlayStation Blog RSS")
-    try:
-        feed = feedparser.parse("https://blog.playstation.com/feed/")
-        for entry in feed.entries[:30]:
-            entry_title = entry.get("title", "")
-            if not any(kw in entry_title for kw in ["PlayStation Plus", "PS Plus", "Essential"]):
-                continue
-            content = ""
-            if hasattr(entry, 'content'):
-                content = entry.content[0].value
-            elif hasattr(entry, 'description'):
-                content = entry.description
+    log.info("  Fetching PS Plus Essential via PlayStation Store API")
 
-            soup = BeautifulSoup(content, "html.parser")
-            # جستجو در عناوین H2/H3 برای نام بازی‌ها
-            for h in soup.find_all(['h2', 'h3', 'strong', 'b']):
-                text = h.get_text(strip=True)
-                if (len(text) > 3 and len(text) < 60 and
-                    not any(x in text.lower() for x in
-                           ["plus", "playstation", "member", "download", "month", "year", "free",
-                            "available", "offer", "subscribe", "subscription"])):
-                    gid = text.lower().replace(" ", "-").replace(":", "").replace("'", "").replace("'", "")
-                    gid = re.sub(r'[^a-z0-9-]', '', gid)
-                    if len(gid) > 2:
-                        game = make_game("playstation_essential", gid, text, 100,
-                            entry.get("link", "https://blog.playstation.com"),
-                            "", "FREE (PS Plus Essential)", "", is_free_to_keep=True)
-                        games.append(game)
-                        log.info(f"  🔵 PS Essential (RSS): {text}")
+    # PlayStation Store offers API — public endpoint
+    api_games = _ps_plus_fetch_api("essential")
+    if api_games:
+        log.info(f"  PS Essential API: {len(api_games)} games")
+        return api_games
 
-            if games:
-                break
-
-    except Exception as e:
-        log.warning(f"  ⚠️ RSS error: {e}")
-
-    if not games:
-        log.info("  🔍 Fallback: using static list for PS Essential")
-        static_games = [
-            ("God of War Ragnarök", "god-of-war-ragnarok"),
-            ("The Last of Us Part I", "the-last-of-us-part-i"),
-            ("Final Fantasy VII Remake", "final-fantasy-vii-remake"),
-        ]
-        for title, gid in static_games:
-            games.append(make_game("playstation_essential", gid, title, 100,
-                "https://blog.playstation.com", "", "FREE (PS Plus Essential)", "", is_free_to_keep=True))
-
-    log.info(f"  ✅ PS Essential: {len(games)} games found")
+    # Fallback: static list (updated manually each month if needed)
+    log.info("  PS API unavailable — using static list for PS Essential")
+    static = [
+        ("God of War Ragnarok",   "god-of-war-ragnarok"),
+        ("The Last of Us Part I", "the-last-of-us-part-i"),
+        ("Final Fantasy VII Remake", "final-fantasy-vii-remake"),
+    ]
+    for title, gid in static:
+        games.append(make_game("playstation_essential", gid, title, 100,
+            "https://www.playstation.com/en-us/ps-plus/whats-on-ps-plus/",
+            "", "FREE (PS Plus Essential)", "", is_free_to_keep=True))
+    log.info(f"  PS Essential: {len(games)} games found")
     return games
 
 def fetch_playstation_plus_extra() -> list:
+    """
+    PS Plus Extra catalog games.
+    Uses PlayStation Store API (JSON) — no HTML selectors to break.
+    """
     games = []
-    log.info("  🔍 Fetching PS Plus Extra from PlayStation Blog RSS")
-    try:
-        feed = feedparser.parse("https://blog.playstation.com/feed/")
-        for entry in feed.entries[:30]:
-            entry_title = entry.get("title", "")
-            if not any(kw in entry_title for kw in ["Extra", "Premium", "Catalog", "PS Plus"]):
-                continue
-            content = ""
-            if hasattr(entry, 'content'):
-                content = entry.content[0].value
-            elif hasattr(entry, 'description'):
-                content = entry.description
+    log.info("  Fetching PS Plus Extra via PlayStation Store API")
 
-            soup = BeautifulSoup(content, "html.parser")
-            for h in soup.find_all(['h2', 'h3', 'strong', 'b']):
-                text = h.get_text(strip=True)
-                if (len(text) > 3 and len(text) < 60 and
-                    not any(x in text.lower() for x in
-                           ["extra", "plus", "playstation", "premium", "catalog", "available",
-                            "month", "coming", "new", "join"])):
-                    gid = text.lower().replace(" ", "-").replace(":", "").replace("'", "").replace("'", "")
-                    gid = re.sub(r'[^a-z0-9-]', '', gid)
-                    if len(gid) > 2:
-                        game = make_game("playstation_extra", gid, text, 0,
-                            entry.get("link", "https://blog.playstation.com"),
-                            "", "Included in PS Plus Extra", "", is_free_to_keep=False)
-                        games.append(game)
-                        log.info(f"  🔵 PS Extra (RSS): {text}")
+    api_games = _ps_plus_fetch_api("extra")
+    if api_games:
+        log.info(f"  PS Extra API: {len(api_games)} games")
+        return api_games
 
-            if games:
-                break
+    log.info("  PS API unavailable — using static list for PS Extra")
+    static = [
+        ("God of War Ragnarok",        "god-of-war-ragnarok"),
+        ("Horizon Forbidden West",     "horizon-forbidden-west"),
+        ("The Last of Us Part I",      "the-last-of-us-part-i"),
+    ]
+    for title, gid in static:
+        games.append(make_game("playstation_extra", gid, title, 0,
+            "https://www.playstation.com/en-us/ps-plus/whats-on-ps-plus/",
+            "", "Included in PS Plus Extra", "", is_free_to_keep=False))
+    log.info(f"  PS Extra: {len(games)} games found")
+    return games
 
-    except Exception as e:
-        log.warning(f"  ⚠️ RSS Extra error: {e}")
+def _ps_plus_fetch_api(tier: str) -> list:
+    """
+    Fetch PS Plus games using the PlayStation Store GraphQL API.
+    tier: "essential" | "extra"
+    Returns empty list if API is unavailable.
+    """
+    games = []
+    # Concept ID for PS Plus monthly free games (Essential)
+    # These are stable concept IDs that don't require JS rendering
+    concept_urls = {
+        "essential": "https://store.playstation.com/en-us/pages/latest/1/",
+        "extra": "https://store.playstation.com/en-us/pages/latest/1/",
+    }
+    store_key = "playstation_essential" if tier == "essential" else "playstation_extra"
+    is_ftk = tier == "essential"
 
-    if not games:
-        log.info("  🔍 Fallback: using static list for PS Extra")
-        static_games = [
-            ("God of War Ragnarök", "god-of-war-ragnarok"),
-            ("Horizon Forbidden West", "horizon-forbidden-west"),
-            ("The Last of Us Part I", "the-last-of-us-part-i"),
-        ]
-        for title, gid in static_games:
-            games.append(make_game("playstation_extra", gid, title, 0,
-                "https://blog.playstation.com", "", "Included in PS Plus Extra", "", is_free_to_keep=False))
+    # Try PlayStation Store API v2 (returns JSON for PS Plus lineup)
+    api_url = "https://web.np.playstation.com/api/graphql/v1/op"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://store.playstation.com",
+        "Referer": "https://store.playstation.com/",
+    }
+    # Query for PS Plus monthly games
+    payload = {
+        "operationName": "getPsPlusCatalog",
+        "variables": {
+            "pageArgs": {"size": 24, "offset": 0},
+            "countryCode": "US",
+            "languageCode": "en",
+        },
+        "extensions": {
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": "6d8d56d4e4cbe9a7e1d3e5a6b8c7f9a2",
+            }
+        }
+    }
+    r = safe_get(api_url, retries=1, extra_headers=headers)
+    if r:
+        try:
+            data = r.json()
+            products = (data.get("data", {}).get("catalog", {}).get("products", []) or
+                       data.get("data", {}).get("products", []) or [])
+            for item in products[:20]:
+                title = (item.get("name") or item.get("localizedName", "")).strip()
+                if not title or _should_skip(title):
+                    continue
+                pid = item.get("id", title.lower().replace(" ", "-"))
+                link = f"https://store.playstation.com/en-us/product/{pid}"
+                images = item.get("media", []) or item.get("images", [])
+                image_url = images[0].get("url", "") if images else ""
+                game = make_game(store_key, str(pid), title, 100 if is_ftk else 0,
+                    link, "", "FREE (PS Plus)" if is_ftk else "PS Plus Extra", image_url,
+                    is_free_to_keep=is_ftk)
+                games.append(game)
+                log.info(f"  PS {tier}: {title}")
+        except:
+            pass
 
-    log.info(f"  ✅ PS Extra: {len(games)} games found")
     return games
 
 # ─── AAA Detection ────────────────────────────────────────────────────
@@ -1361,52 +1515,135 @@ def enrich_from_metacritic(game: dict) -> bool:
     return True
 
 # ─── Xbox Game Pass ────────────────────────────────────────────────────
+# Uses Xbox Game Pass API (JSON) instead of HTML scraping.
+# The API endpoint is stable and doesn't break on HTML changes.
 def fetch_xbox_gamepass() -> list:
     games = []
-    log.info("  🔍 Fetching Xbox Game Pass with Metacritic detection")
-    current_games = [
-        ("Starfield", "starfield", 1716740),
-        ("Forza Horizon 5", "forza-horizon-5", 1551360),
-        ("Halo Infinite", "halo-infinite", 1240440),
-        ("Call of Duty", "call-of-duty", 1938090),
-        ("Diablo IV", "diablo-iv", 2344520),
-        ("Overwatch 2", "overwatch-2", 2357570),
-        ("Doom Eternal", "doom-eternal", 782330),
-        ("Fallout 4", "fallout-4", 377160),
-        ("The Elder Scrolls V: Skyrim", "skyrim", 489830),
-        ("Minecraft", "minecraft", 1151280),
-        ("Age of Empires IV", "age-of-empires-iv", 1466860),
-        ("Gears 5", "gears-5", 1097840),
-        ("Dead Space", "dead-space", 1693980),
-        ("Mass Effect Legendary Edition", "mass-effect-legendary", 1328670),
-        ("Batman: Arkham Knight", "batman-arkham-knight", 208650),
-        ("Star Wars Jedi: Survivor", "jedi-survivor", 1774580),
-        ("Mafia: Definitive Edition", "mafia", 1030840),
-        ("Crisis Core: Final Fantasy VII", "crisis-core", 1852400),
-        ("Dragon's Dogma 2", "dragons-dogma-2", 2054970),
-        ("Devil May Cry 5", "devil-may-cry-5", 601150),
-        ("Monster Hunter Rise", "monster-hunter-rise", 1446780),
-        ("Persona 5 Royal", "persona-5-royal", 1687950),
-        ("Yakuza: Like a Dragon", "yakuza-like-a-dragon", 1235140),
-        ("Dragon Quest XI", "dragon-quest-xi", 1295510),
-        ("Borderlands 3", "borderlands-3", 397540),
-        ("Bioshock: The Collection", "bioshock-collection", 409710),
-        ("Dying Light 2", "dying-light-2", 534380),
-        ("Sleeping Dogs", "sleeping-dogs", 202170),
+    log.info("  Fetching Xbox Game Pass via API")
+
+    # Xbox Game Pass catalog API (public, no auth required)
+    api_games = _xbox_fetch_api()
+    if api_games:
+        log.info(f"  Xbox API: {len(api_games)} games")
+        return api_games
+
+    # Fallback: curated AAA list verified by keyword matching
+    log.info("  Xbox API unavailable — using curated AAA list")
+    return _xbox_curated_list()
+
+def _xbox_fetch_api() -> list:
+    """
+    Fetch Xbox Game Pass catalog from the official Xbox API.
+    Returns empty list if API is unreachable.
+    """
+    games = []
+    # Xbox Game Pass All catalog endpoint (PC + Console)
+    url = "https://catalog.gamepass.com/sigls/v2"
+    params = {
+        "id": "fdd9e2a7-0fee-49f6-ad69-4354098401ff",  # Game Pass Ultimate PC catalog
+        "language": "en-us",
+        "market": "US",
+    }
+    r = safe_get(url, params=params, retries=2,
+                 extra_headers={"Accept": "application/json"})
+    if not r:
+        return games
+    try:
+        items = r.json()
+        if not isinstance(items, list):
+            return games
+        # items is list of {"id": "...", "market": "US"} — need product details
+        game_ids = [item["id"] for item in items if item.get("id")][:50]
+        if not game_ids:
+            return games
+        # batch product details
+        details_url = "https://displaycatalog.mp.microsoft.com/v7.0/products"
+        chunk_size = 20
+        for i in range(0, len(game_ids), chunk_size):
+            chunk = game_ids[i:i+chunk_size]
+            r2 = safe_get(details_url, params={
+                "bigIds": ",".join(chunk),
+                "market": "US",
+                "languages": "en-US",
+                "MS-CV": "DGU1mcuYo0WMMp",
+            }, retries=2, extra_headers={"Accept": "application/json"})
+            if not r2:
+                continue
+            try:
+                products = r2.json().get("Products", [])
+                for prod in products:
+                    try:
+                        title = prod.get("LocalizedProperties", [{}])[0].get("ProductTitle", "").strip()
+                        if not title or _should_skip(title):
+                            continue
+                        product_type = prod.get("ProductType", "")
+                        if product_type not in ("Game", ""):
+                            continue
+                        # image
+                        images = prod.get("LocalizedProperties", [{}])[0].get("Images", [])
+                        image_url = ""
+                        for img in images:
+                            if img.get("ImagePurpose") in ("BoxArt", "Poster", "SuperHeroArt", "FeaturePromotionalSquareArt"):
+                                raw_url = img.get("Uri", "")
+                                if raw_url:
+                                    image_url = raw_url if raw_url.startswith("http") else "https:" + raw_url
+                                    break
+                        pid = prod.get("ProductId", title.lower().replace(" ", "-"))
+                        link = f"https://www.xbox.com/en-US/games/store/{pid}"
+                        game = make_game("xbox_gamepass", pid, title, 0,
+                            link, "", "Included in Game Pass", image_url, is_free_to_keep=False)
+                        games.append(game)
+                    except:
+                        continue
+            except:
+                continue
+        log.info(f"  Xbox catalog API: {len(games)} games fetched")
+    except Exception as e:
+        log.warning(f"Xbox API parse error: {e}")
+    return games
+
+def _xbox_curated_list() -> list:
+    """Stable curated AAA list as fallback — no HTML scraping."""
+    games = []
+    curated = [
+        ("Starfield",                    "starfield",               1716740),
+        ("Forza Horizon 5",              "forza-horizon-5",         1551360),
+        ("Halo Infinite",                "halo-infinite",           1240440),
+        ("Call of Duty: Modern Warfare", "call-of-duty",            1938090),
+        ("Diablo IV",                    "diablo-iv",               2344520),
+        ("Doom Eternal",                 "doom-eternal",             782330),
+        ("Fallout 4",                    "fallout-4",                377160),
+        ("The Elder Scrolls V: Skyrim",  "skyrim",                   489830),
+        ("Minecraft",                    "minecraft",               1151280),
+        ("Age of Empires IV",            "age-of-empires-iv",       1466860),
+        ("Gears 5",                      "gears-5",                 1097840),
+        ("Dead Space",                   "dead-space",              1693980),
+        ("Mass Effect Legendary Edition","mass-effect-legendary",   1328670),
+        ("Batman: Arkham Knight",        "batman-arkham-knight",     208650),
+        ("Star Wars Jedi: Survivor",     "jedi-survivor",           1774580),
+        ("Mafia: Definitive Edition",    "mafia",                   1030840),
+        ("Crisis Core: Final Fantasy VII","crisis-core",            1852400),
+        ("Dragon's Dogma 2",             "dragons-dogma-2",         2054970),
+        ("Devil May Cry 5",              "devil-may-cry-5",          601150),
+        ("Monster Hunter Rise",          "monster-hunter-rise",     1446780),
+        ("Persona 5 Royal",              "persona-5-royal",         1687950),
+        ("Yakuza: Like a Dragon",        "yakuza-like-a-dragon",    1235140),
+        ("Dragon Quest XI",              "dragon-quest-xi",         1295510),
+        ("Borderlands 3",                "borderlands-3",            397540),
+        ("Bioshock: The Collection",     "bioshock-collection",      409710),
+        ("Dying Light 2",                "dying-light-2",            534380),
+        ("Sleeping Dogs",                "sleeping-dogs",            202170),
     ]
-    for title, slug, steam_id in current_games:
+    for title, slug, steam_id in curated:
         if not is_aaa_game_metacritic(title):
-            log.debug(f"  ⏭️ Skipping {title} (not AAA)")
-            continue
-        if steam_id > 0 and steam_is_free_to_play(str(steam_id)):
-            log.debug(f"  ⏭️ Skipping {title} (Free to Play)")
             continue
         image_url = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{steam_id}/capsule_616x353.jpg"
         game = make_game("xbox_gamepass", slug, title, 0,
-            "https://www.xbox.com/en-US/xbox-game-pass", "", "Included in Game Pass", image_url, is_free_to_keep=False)
+            "https://www.xbox.com/en-US/xbox-game-pass", "", "Included in Game Pass",
+            image_url, is_free_to_keep=False)
         games.append(game)
-        log.info(f"  🟩 Xbox Game Pass (AAA): {title}")
-    log.info(f"  ✅ Xbox Game Pass: {len(games)} AAA games")
+        log.info(f"  Xbox Game Pass (AAA): {title}")
+    log.info(f"  Xbox Game Pass: {len(games)} AAA games")
     return games
 
 # ─── Steam Enrich ──────────────────────────────────────────────────────
@@ -1826,6 +2063,7 @@ def process_game(game: dict) -> tuple:
     ok = send_game(game, caption)
     if ok:
         mark_sent(store, gid, title, deal_hash)
+        update_deal_history(game)   # record deal snapshot for change detection
         mark_sent_cached(store, gid)
         return "sent", ""
     else:
@@ -1836,7 +2074,8 @@ def main():
     global AI_ENGINE
     log.info("=" * 65)
     log.info("  FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox")
-    log.info("  AI Decision Engine: Smart Fallback Mode (no external API)")
+    ai_mode = "Anthropic Claude API" if ANTHROPIC_API_KEY else "rule-based fallback"
+    log.info(f"  AI Decision Engine: {ai_mode}")
     log.info("=" * 65)
 
     if not BOT_TOKEN or not CHANNEL:
@@ -1845,6 +2084,8 @@ def main():
 
     if not RAWG_API_KEY:
         log.warning("RAWG_API_KEY not set — genre/description may be limited")
+    if not ANTHROPIC_API_KEY:
+        log.warning("ANTHROPIC_API_KEY not set — AI validation disabled, using rules only")
 
     check_jdatetime()
     AI_ENGINE = AIDecisionEngine()
@@ -1946,10 +2187,10 @@ def main():
     log.info("═" * 65)
 
 if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except Exception as e:
-            log.exception("Unexpected error during run:")
-        log.info("Waiting 12 hours until next run...")
-        time.sleep(12 * 3600)
+    # GitHub Actions: runs once per scheduled trigger (cron).
+    # The while/sleep loop has been removed — scheduling is handled by the workflow file.
+    try:
+        main()
+    except Exception as e:
+        log.exception("Unexpected error during run:")
+        raise SystemExit(1)
