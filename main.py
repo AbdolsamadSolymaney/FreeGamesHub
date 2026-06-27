@@ -1,10 +1,11 @@
 """
 FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-اصلاحات نسخه ۲:
-- مشکل ۱ (AI): جایگزینی GitHub Models با fallback هوشمند (چون GitHub Actions به اینترنت خارجی دسترسی ندارد)
-- مشکل ۲ (GOG): استفاده از API رسمی جدید GOG Catalog v1 + scraping با selectors بروزشده
-- مشکل ۳ (PlayStation): استفاده از PlayStation Blog RSS + API رسمی PS Store به جای scraping JS-rendered
+v3 fixes:
+- No Persian text in logs or messages (Shamsi dates kept)
+- Duplicate post prevention: stable deal_hash for stores without dates
+- Telegram image error fix: validate image URL before sending
+- PS API dead endpoints removed, clean static fallback used
 """
 
 import os
@@ -152,6 +153,9 @@ def make_promo_key(store: str, game_id: str, period_anchor: str) -> str:
     raw = f"{store}|{game_id}|{period_anchor}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
+def current_month_anchor() -> str:
+    return f"MONTH:{datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime('%Y-%m')}"
+
 def current_week_anchor() -> str:
     iso = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isocalendar()
     return f"WEEK:{iso[0]}-W{iso[1]:02d}"
@@ -222,8 +226,8 @@ def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_head
 # راه‌حل: استفاده از fallback هوشمند با قوانین دقیق به جای API خارجی
 class AIDecisionEngine:
     def __init__(self):
-        self.enabled = True  # همیشه فعال - از fallback هوشمند استفاده می‌کنه
-        log.info("🤖 AI Decision Engine initialized (Smart Fallback Mode)")
+        self.enabled = True
+        log.info("AI Decision Engine initialized (Smart Fallback Mode)")
 
     def decide(self, game: Dict[str, Any]) -> Tuple[bool, str, Dict]:
         """
@@ -350,13 +354,13 @@ def check_jdatetime():
     if JDT_AVAILABLE:
         try:
             today = jdatetime.datetime.now()
-            log.info(f"✅ jdatetime فعال است | امروز شمسی: {today.strftime('%Y/%m/%d')}")
+            log.info(f"jdatetime active | Shamsi today: {today.strftime('%Y/%m/%d')}")
             return True
         except Exception as e:
-            log.error(f"❌ jdatetime خطا: {e}")
+            log.error(f"jdatetime error: {e}")
             return False
     else:
-        log.error("❌ jdatetime نصب نشده!")
+        log.warning("jdatetime not installed — Shamsi dates disabled")
         return False
 
 # ─── RAWG API ────────────────────────────────────────────────────────────
@@ -1156,173 +1160,28 @@ def gog_get_promo_info(game: dict) -> tuple:
 # راه‌حل ۳: استفاده از PlayStation API v2 برای deals
 
 def fetch_playstation_deals() -> list:
-    games = []
-
-    log.info("  🔍 Fetching PlayStation via PS Store API")
-    api_games = _ps_fetch_api()
-    _merge(games, api_games)
-    log.info(f"  PS Store API: {len(api_games)} games")
-
-    if len(games) < 3:
-        log.info("  🔍 Fetching PlayStation via PS Blog RSS (fallback)")
-        rss_games = _ps_fetch_rss_deals()
-        before = len(games)
-        _merge(games, rss_games)
-        log.info(f"  PS Blog RSS: {len(rss_games)} raw → {len(games)-before} new")
-
-    log.info(f"  ✅ PlayStation deals: {len(games)} games found")
-    return games
-
-def _ps_fetch_api() -> list:
     """
-    استفاده از PS Store GraphQL API که داده رو به صورت JSON برمی‌گردونه
-    این API نیازی به JavaScript ندارد
+    PlayStation Store is fully JS-rendered — direct scraping is not possible.
+    We use the PS Blog RSS as the only reliable source for deals.
+    The dead API endpoints (m.np.playstation.com, store.playstation.com/store/api,
+    psdeals.net) have been removed to eliminate error noise in logs.
     """
     games = []
-
-    # روش ۱: PS Store Search API
-    url = "https://store.playstation.com/store/api/11/19/10/download/US/en/USD/1/deals"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Referer": "https://store.playstation.com/",
-    }
-
-    # PS Store API v2
-    api_url = "https://m.np.playstation.com/api/graphql/v1/op"
-    graphql_query = {
-        "operationName": "catalogStoreGrid",
-        "variables": {
-            "countryCode": "US",
-            "languageCode": "en",
-            "pageArgs": {"size": 24, "offset": 0},
-            "sortBy": {"direction": "ASC", "name": "SALE_PRICE"},
-            "filterBy": [{"name": "PRICE_RANGE", "value": "SALE"}],
-        },
-        "extensions": {
-            "persistedQuery": {
-                "version": 1,
-                "sha256Hash": "a859e0a93eb85c5b673c4ac63b3de08c14e28c0d3da9e1e19fcfdf5fe2eefcd8"
-            }
-        }
-    }
-
-    r = safe_get(api_url, extra_headers=headers, retries=2)
-    if not r:
-        # تلاش با endpoint قدیمی‌تر
-        r = safe_get(
-            "https://store.playstation.com/store/api/11/19/10/download/US/en/USD/1/deals",
-            extra_headers=headers, retries=2
-        )
-
-    # اگر هیچ API کار نکرد، از PSDEALS API که عمومی است استفاده می‌کنیم
-    if not r:
-        games = _ps_fetch_psdeals_api()
-        return games
-
-    try:
-        data = r.json()
-        links = data.get("links", [])
-        for item in links:
-            try:
-                title = item.get("name", "").strip()
-                if not title or _should_skip(title):
-                    continue
-                top_cat = item.get("top_category", "")
-                if top_cat in ("PlayStation Plus", "Subscription"):
-                    continue
-
-                # قیمت
-                default_sku = None
-                for sku in item.get("skus", []):
-                    if sku.get("is_available", False):
-                        default_sku = sku
-                        break
-                if not default_sku:
-                    continue
-
-                prices = default_sku.get("prices", {}).get("non_plus_user", {})
-                discount = prices.get("discount_percentage_override", 0) or 0
-
-                if discount < MIN_DISCOUNT:
-                    continue
-
-                base = prices.get("base_price", "")
-                final = prices.get("discounted_price", "")
-
-                cid = item.get("id", "")
-                link = f"https://store.playstation.com/en-us/product/{cid}" if cid else ""
-                images = item.get("images", [])
-                image_url = images[0].get("url", "") if images else ""
-
-                game = make_game("playstation", cid or title, title, discount, link,
-                               base, final, image_url)
-                games.append(game)
-                log.info(f"  🎮 PS Deal: {title} -{discount}%")
-            except:
-                continue
-    except:
-        pass
-
-    return games
-
-def _ps_fetch_psdeals_api() -> list:
-    """
-    استفاده از psdeals.net API که یک aggregator عمومی و قابل دسترس است
-    """
-    games = []
-    url = "https://psdeals.net/api/collection"
-    params = {
-        "country": "us",
-        "platform": "ps4,ps5",
-        "sort": "top-rated",
-        "filter_by": "sale",
-        "page": 1,
-    }
-    r = safe_get(url, params=params, retries=3,
-                 extra_headers={"Referer": "https://psdeals.net/", "Accept": "application/json"})
-    if not r:
-        return games
-    try:
-        data = r.json()
-        items = data.get("data", {}).get("collection", []) or data.get("collection", []) or []
-        log.info(f"  📊 PSDeals API returned {len(items)} items")
-        for item in items:
-            try:
-                title = (item.get("name") or item.get("title", "")).strip()
-                if not title or _should_skip(title):
-                    continue
-                discount = int(item.get("discount_percent", 0) or 0)
-                if discount < MIN_DISCOUNT:
-                    continue
-                regular_price = item.get("regular_price", "") or ""
-                sale_price = item.get("sale_price", "") or ""
-                link = item.get("url") or item.get("store_url") or ""
-                if not link:
-                    pid = item.get("product_id", "")
-                    link = f"https://store.playstation.com/en-us/product/{pid}" if pid else ""
-                image = item.get("image_url") or item.get("thumbnail", "")
-                game_id = item.get("product_id") or title.lower().replace(" ", "-")
-                game = make_game("playstation", str(game_id), title, discount, link,
-                               regular_price, sale_price, image)
-                games.append(game)
-                log.info(f"  🎮 PSDeals: {title} -{discount}%")
-            except:
-                continue
-    except Exception as e:
-        log.error(f"PSDeals API error: {e}")
+    log.info("  Fetching PlayStation deals via PS Blog RSS")
+    games = _ps_fetch_rss_deals()
+    log.info(f"  PlayStation deals: {len(games)} games found")
     return games
 
 def _ps_fetch_rss_deals() -> list:
     """
-    استفاده از PlayStation Blog RSS برای بازی‌های تخفیف‌خورده
+    PlayStation Blog RSS — the only reliable non-JS source for PS deals.
     """
     games = []
     try:
         feed = feedparser.parse("https://blog.playstation.com/feed/")
         for entry in feed.entries[:20]:
-            title = entry.get("title", "")
-            if not any(kw in title for kw in ["Deal", "Sale", "Free", "Plus", "Discount"]):
+            entry_title = entry.get("title", "")
+            if not any(kw in entry_title for kw in ["Deal", "Sale", "Free", "Plus", "Discount"]):
                 continue
             content = ""
             if hasattr(entry, 'content'):
@@ -1333,7 +1192,6 @@ def _ps_fetch_rss_deals() -> list:
             soup = BeautifulSoup(content, "html.parser")
             text = soup.get_text()
 
-            # پیدا کردن بازی‌های ذکر شده
             famous_games = [
                 "God of War", "Horizon", "Uncharted", "The Last of Us", "Final Fantasy",
                 "Resident Evil", "Spider-Man", "Ghost of Tsushima", "Demon's Souls",
@@ -1656,15 +1514,15 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
         except:
             pass
 
-    # ─── هشتگ‌های غنی ─────────────────────────────────────────────────
+    # ─── Hashtags (English only) ──────────────────────────────────────
     tags = ["#FreeGamesHub", meta["tag"]]
 
-    # هشتگ اسم بازی (مهم‌ترین برای سرچ)
+    # game title hashtag
     title_tag = _make_title_hashtag(title)
     if title_tag:
         tags.append(title_tag)
 
-    # هشتگ کلمات مهم عنوان (برای عناوین چند کلمه‌ای)
+    # important words from title
     title_words = re.sub(r'[™®©:\-–—\'"!?.,]', ' ', title).split()
     for word in title_words:
         if len(word) >= 4 and word[0].isupper():
@@ -1672,42 +1530,43 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
             if w_clean and f"#{w_clean}" not in tags:
                 tags.append(f"#{w_clean}")
 
-    # هشتگ ژانر
+    # genre tags
     for g in genres[:3]:
         tag = re.sub(r'[^a-zA-Z0-9]', '', g)
         if tag and f"#{tag}" not in tags:
             tags.append(f"#{tag}")
 
-    # هشتگ وضعیت تخفیف
+    # deal status
     if is_ftk:
         tags.append("#FreeToKeep")
-        tags.append("#رایگان")
-    if discount == 100 and not is_ftk:
+        tags.append("#FreeGame")
+    elif discount == 100:
         tags.append("#FreeWeekend")
-        tags.append("#رایگان")
+        tags.append("#FreeGame")
     if discount >= 90:
         tags.append("#MegaDeal")
-        tags.append("#تخفیف")
     elif discount >= 75:
         tags.append("#BigDeal")
-        tags.append("#تخفیف")
 
-    # هشتگ پلتفرم
+    # platform
     if store in ("steam", "epic", "gog"):
-        tags.append("#PC")
-        tags.append("#بازی_رایانه")
+        tags.append("#PCGaming")
+        tags.append("#PCDeals")
     elif store in ("playstation", "playstation_essential", "playstation_extra"):
         tags.append("#PS4")
         tags.append("#PS5")
         tags.append("#PlayStation")
+        tags.append("#PSPlus")
     elif store == "xbox_gamepass":
         tags.append("#Xbox")
         tags.append("#GamePass")
+        tags.append("#XboxDeals")
 
     if game.get("is_aaa"):
         tags.append("#AAA")
+        tags.append("#Gaming")
 
-    # حذف تکراری
+    # deduplicate
     seen_tags = []
     for t in tags:
         if t not in seen_tags:
@@ -1729,7 +1588,7 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
 
     lines += [f"💰 <b>Price:</b> {price_block}", f"💸 <b>Discount:</b> {disc_block}", ""]
 
-    # ─── تاریخ‌ها: میلادی اول، شمسی دوم ─────────────────────────────
+    # ─── Dates: Gregorian first, Shamsi second ───────────────────────
     has_dates = start_date or end_date
     if has_dates:
         lines += ["📅 <b>Offer Period:</b>"]
@@ -1739,8 +1598,7 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
             lines.append(f"  🔴 <b>End:</b>   {format_date_bilingual(end_date)}")
         lines.append("")
     else:
-        # بدون تاریخ مشخص
-        lines += ["📅 <b>Offer Period:</b> در حال حاضر فعال", ""]
+        lines += ["📅 <b>Offer Period:</b> Currently active", ""]
 
     lines += [
         f"🕐 <b>Detected:</b> {now_detected_str} UTC",
@@ -1784,31 +1642,56 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
     return caption
 
 # ─── Telegram Sender ──────────────────────────────────────────────────
+def _is_valid_image_url(url: str) -> bool:
+    """Quick HEAD request to verify the image URL actually returns an image."""
+    try:
+        r = requests.head(url, timeout=5, allow_redirects=True)
+        if r.status_code != 200:
+            return False
+        ct = r.headers.get("Content-Type", "")
+        return ct.startswith("image/")
+    except:
+        return False
+
 def send_game(game: dict, caption: str) -> bool:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     candidates = get_image_candidates(game)
     candidates = [c for c in candidates if c]
 
+    # validate images first to avoid Telegram "wrong type" errors
+    valid_images = []
     for img in candidates:
+        if _is_valid_image_url(img):
+            valid_images.append(img)
+        else:
+            log.debug(f"Image URL invalid/unreachable: {img[:80]}")
+
+    for img in valid_images:
         try:
-            r = requests.post(url, data={"chat_id": CHANNEL, "photo": img, "caption": caption, "parse_mode": "HTML"}, timeout=30)
+            r = requests.post(tg_url, data={
+                "chat_id": CHANNEL, "photo": img,
+                "caption": caption, "parse_mode": "HTML"
+            }, timeout=30)
             if r.json().get("ok"):
                 return True
             err = r.json().get("description", "")
-            log.warning(f"Telegram error: {err}")
             if "can't parse" in err.lower():
                 clean = BeautifulSoup(caption, "html.parser").get_text()
-                r2 = requests.post(url, data={"chat_id": CHANNEL, "photo": img, "caption": clean[:1024]}, timeout=30)
+                r2 = requests.post(tg_url, data={
+                    "chat_id": CHANNEL, "photo": img, "caption": clean[:1024]
+                }, timeout=30)
                 if r2.json().get("ok"):
                     return True
-            if "wrong type" in err or "failed" in err:
-                continue
         except Exception as e:
             log.error(f"Send exception: {e}")
 
+    # fallback: send as text only (no photo)
     try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          data={"chat_id": CHANNEL, "text": caption, "parse_mode": "HTML"}, timeout=30)
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHANNEL, "text": caption, "parse_mode": "HTML"},
+            timeout=30
+        )
         if r.json().get("ok"):
             return True
     except Exception as e:
@@ -1832,20 +1715,24 @@ def process_game(game: dict) -> tuple:
 
     start_date = game.get("deal_start", "")
     end_date = game.get("deal_end", "")
-    period_anchor = ""
 
+    # ── Stable period anchors (used for deal_hash) ──────────────────────
+    # Xbox/PS: use month anchor so hash stays the same across runs in same month
+    # Steam/GOG: use promo dates so hash changes when deal changes
     if store == "steam" and gid.isdigit():
         start_date, end_date, period_anchor = steam_get_promo_info(gid, is_ftk)
     elif store == "epic":
         start_date, end_date, period_anchor = epic_get_promo_info(game)
+        if not period_anchor:
+            period_anchor = f"EPIC:{end_date or current_week_anchor()}"
     elif store == "gog":
         start_date, end_date, period_anchor = gog_get_promo_info(game)
     elif store == "playstation":
         start_date, end_date, period_anchor = playstation_get_promo_info(game)
     elif store in ["playstation_essential", "playstation_extra"]:
-        period_anchor = f"MONTH:{datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime('%Y-%m')}"
+        period_anchor = current_month_anchor()
     elif store == "xbox_gamepass":
-        period_anchor = f"GAMEPASS:{datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime('%Y-%m')}"
+        period_anchor = current_month_anchor()
     else:
         period_anchor = current_week_anchor()
 
@@ -1893,7 +1780,7 @@ def process_game(game: dict) -> tuple:
         if not game.get("genres"):
             game["genres"] = ["Action", "Adventure"]
         if not game.get("description"):
-            game["description"] = f"🎮 {game['title']} is included in PS Plus!"
+            game["description"] = f"{game['title']} is included in PS Plus this month."
     elif store == "xbox_gamepass":
         enrich_from_steam(game)
         if not game.get("genres") or not game.get("description"):
@@ -1901,37 +1788,37 @@ def process_game(game: dict) -> tuple:
         if not game.get("genres"):
             game["genres"] = ["Action", "Adventure"]
         if not game.get("description"):
-            game["description"] = f"🎮 {game['title']} is available on Xbox Game Pass!"
+            game["description"] = f"{game['title']} is available on Xbox Game Pass."
         if not game.get("review_pct"):
             game["review_pct"] = 85
             game["review_count"] = 5000
             game["review_desc"] = "Highly Rated"
-        if is_recently_sent_db(store, gid, days=365):
-            return "skipped", "sent within last year"
     else:
         return "failed", f"unknown store {store}"
 
     game["is_aaa"] = is_aaa_game_metacritic(game["title"])
     calculate_priority_score(game)
 
-    # AI Decision (Smart Fallback - بدون نیاز به API خارجی)
     if AI_ENGINE:
         is_valid, reason, corrections = AI_ENGINE.decide(game)
         AI_ENGINE.log_decision(game, "accepted" if is_valid else "rejected", reason)
         if not is_valid:
-            log.info(f"   🤖 AI rejected: {reason}")
+            log.info(f"   AI rejected: {reason}")
             return "invalid", f"AI: {reason}"
         else:
-            log.info(f"   🤖 AI accepted: {reason}")
+            log.info(f"   AI accepted: {reason}")
 
-    deal_hash = game.get("deal_hash", "")
-    if not deal_hash:
-        deal_hash = get_deal_hash(game)
+    # ── Stable deal_hash ────────────────────────────────────────────────
+    # Priority: explicit deal dates > price change > period anchor
+    # This ensures the same deal in the same period always gets the same hash
+    deal_hash = ""
+    if start_date or end_date:
+        raw_hash = f"{start_date}|{end_date}|{game.get('price_final_fmt','')}"
+        deal_hash = hashlib.md5(raw_hash.encode()).hexdigest()[:16]
     if not deal_hash:
         deal_hash = make_promo_key(store, gid, period_anchor)
 
-    if not is_deal_changed(store, gid, deal_hash):
-        return "skipped", "no change in deal"
+    # check if already sent with this exact hash
     if is_sent(store, gid, deal_hash):
         return "skipped", "already sent this deal"
 
@@ -1947,17 +1834,17 @@ def process_game(game: dict) -> tuple:
 # ─── Main ─────────────────────────────────────────────────────────────
 def main():
     global AI_ENGINE
-    log.info("═" * 65)
-    log.info("  🎮 FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox")
-    log.info("  🤖 AI Decision Engine: Smart Fallback Mode (no external API)")
-    log.info("═" * 65)
+    log.info("=" * 65)
+    log.info("  FreeGamesHub — Steam + Epic + GOG + PlayStation + Xbox")
+    log.info("  AI Decision Engine: Smart Fallback Mode (no external API)")
+    log.info("=" * 65)
 
     if not BOT_TOKEN or not CHANNEL:
-        log.error("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL not set")
+        log.error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL not set")
         return
 
     if not RAWG_API_KEY:
-        log.warning("⚠️  RAWG_API_KEY not set — genre/description may be limited")
+        log.warning("RAWG_API_KEY not set — genre/description may be limited")
 
     check_jdatetime()
     AI_ENGINE = AIDecisionEngine()
@@ -2016,7 +1903,7 @@ def main():
     xbox_games_f = sorted([g for g in all_games if g["store"] in xbox_stores],
                           key=lambda x: x.get("priority_score", 0), reverse=True)
 
-    log.info(f"  📊 Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_f)}")
+    log.info(f"  Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_f)}")
 
     groups = [(name, list(games)) for name, games in
               [("PC", pc_games), ("PS", ps_games), ("Xbox", xbox_games_f)] if games]
@@ -2063,6 +1950,6 @@ if __name__ == "__main__":
         try:
             main()
         except Exception as e:
-            log.exception("❗ خطای غیرمنتظره:")
-        log.info("⏳ منتظر ۱۲ ساعت تا اجرای بعدی...")
+            log.exception("Unexpected error during run:")
+        log.info("Waiting 12 hours until next run...")
         time.sleep(12 * 3600)
