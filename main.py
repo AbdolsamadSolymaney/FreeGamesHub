@@ -84,12 +84,12 @@ def is_recently_sent_cached(store: str, game_id: str, hours: int = 24) -> bool:
     key = (store, game_id)
     if key in SENT_CACHE:
         last_sent = SENT_CACHE[key]
-        if (datetime.datetime.utcnow() - last_sent).total_seconds() < hours * 3600:
+        if (datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - last_sent).total_seconds() < hours * 3600:
             return True
     return False
 
 def mark_sent_cached(store: str, game_id: str):
-    SENT_CACHE[(store, game_id)] = datetime.datetime.utcnow()
+    SENT_CACHE[(store, game_id)] = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
 
 # ─── Database ────────────────────────────────────────────────────────────
 def init_db():
@@ -139,7 +139,7 @@ def is_sent(store: str, game_id: str, deal_hash: str) -> bool:
     return row is not None
 
 def mark_sent(store: str, game_id: str, title: str, deal_hash: str):
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(DB_FILE)
     conn.execute(
         "INSERT OR IGNORE INTO sent (store, game_id, deal_hash, title, sent_at) VALUES (?,?,?,?,?)",
@@ -153,7 +153,7 @@ def make_promo_key(store: str, game_id: str, period_anchor: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 def current_week_anchor() -> str:
-    iso = datetime.datetime.utcnow().isocalendar()
+    iso = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isocalendar()
     return f"WEEK:{iso[0]}-W{iso[1]:02d}"
 
 def get_deal_hash(game: dict) -> str:
@@ -187,7 +187,7 @@ def is_recently_sent_db(store: str, game_id: str, days: int = 365) -> bool:
         return False
     try:
         last = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-        diff = (datetime.datetime.utcnow() - last).days
+        diff = (datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - last).days
         return diff < days
     except:
         return False
@@ -265,7 +265,7 @@ class AIDecisionEngine:
                 if s > e:
                     return False, "Start date is after end date", {}
                 # چک منقضی بودن
-                if e < datetime.datetime.utcnow():
+                if e < datetime.datetime.now(datetime.UTC).replace(tzinfo=None):
                     return False, "Deal already expired", {}
             except:
                 pass
@@ -306,7 +306,7 @@ class AIDecisionEngine:
                 game.get('id', 'unknown'),
                 game.get('title', 'unknown'),
                 decision, 0, reason,
-                datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
             ))
             conn.commit()
             conn.close()
@@ -314,7 +314,8 @@ class AIDecisionEngine:
             log.warning(f"AI log error: {e}")
 
 # ─── Date Formatter ────────────────────────────────────────────────────
-def format_date_persian_english(date_str: str) -> str:
+def format_date_bilingual(date_str: str) -> str:
+    """تاریخ را به صورت میلادی اول و شمسی دوم برمی‌گرداند"""
     if not date_str or not date_str.strip():
         return "نامشخص"
     date_str_clean = date_str.split("T")[0].split(" ")[0].strip()
@@ -328,17 +329,22 @@ def format_date_persian_english(date_str: str) -> str:
             continue
     if dt is None:
         return date_str_clean
+    # میلادی اول
     gregorian = dt.strftime("%d %b %Y")
     if JDT_AVAILABLE and jdatetime:
         try:
             jd = jdatetime.datetime.fromgregorian(datetime=dt)
             persian = jd.strftime("%Y/%m/%d")
-            return f"{persian}\n{gregorian}"
+            return f"{gregorian} | {persian}"   # میلادی | شمسی در یک خط
         except Exception as e:
             log.warning(f"jdatetime conversion failed: {e}")
             return gregorian
     else:
         return gregorian
+
+# alias برای سازگاری با کدهای قدیمی‌تر
+def format_date_persian_english(date_str: str) -> str:
+    return format_date_bilingual(date_str)
 
 def check_jdatetime():
     if JDT_AVAILABLE:
@@ -759,7 +765,7 @@ def fetch_epic_games() -> list:
     try:
         data = r.json()
         elements = data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
         for el in elements:
             title = el.get("title", "").strip()
             if not title:
@@ -819,7 +825,7 @@ def epic_get_promo_info(game: dict) -> tuple:
     try:
         data = r.json()
         elements = data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
         for el in elements:
             eid = str(el.get("id") or el.get("productSlug") or "")
             if eid != game["id"] and el.get("title", "") != game["title"]:
@@ -894,7 +900,6 @@ def _gog_fetch_catalog_api() -> list:
     }
     r = safe_get(url, params=params, retries=3, extra_headers=headers)
     if not r:
-        # تلاش با cloudscraper
         r = safe_get(url, params=params, retries=2, use_scraper=True, extra_headers=headers)
     if not r:
         log.warning("  ⚠️ GOG Catalog API failed")
@@ -905,69 +910,94 @@ def _gog_fetch_catalog_api() -> list:
         products = data.get("products", [])
         log.info(f"  📊 GOG Catalog API returned {len(products)} products")
 
+        # debug: ساختار اولین محصول رو لاگ کن
+        if products:
+            first = products[0]
+            price_raw = first.get("price", {})
+            log.info(f"  🔍 GOG price structure sample: {json.dumps(price_raw)[:300]}")
+
         for item in products:
             try:
                 title = item.get("title", "").strip()
                 if not title or _should_skip(title):
                     continue
 
-                # استخراج قیمت و تخفیف
                 price_info = item.get("price", {}) or {}
 
-                # روش جدید: price.final و price.base
-                base_price = price_info.get("base", 0)
-                final_price = price_info.get("final", 0)
-                discount = int(price_info.get("discountPercentage", 0) or 0)
+                # ساختار GOG Catalog API — چند فرمت مختلف را امتحان می‌کنیم
+                discount = 0
+                base_price = 0.0
+                final_price = 0.0
 
-                # اگر discount خالی بود، محاسبه دستی
-                if discount == 0 and base_price and final_price:
+                # فرمت ۱: {"base":"$59.99","final":"$14.99","discountPercentage":"75"}
+                if "discountPercentage" in price_info:
                     try:
-                        base_f = float(base_price)
-                        final_f = float(final_price)
-                        if base_f > 0 and final_f < base_f:
-                            discount = int((1 - final_f / base_f) * 100)
+                        discount = int(str(price_info["discountPercentage"]).replace("%","").strip() or 0)
                     except:
                         pass
+
+                # فرمت ۲: {"baseAmount":"59.99","finalAmount":"14.99","discount":"-75%"}
+                if discount == 0 and "discount" in price_info:
+                    try:
+                        d = str(price_info["discount"]).replace("%","").replace("-","").strip()
+                        discount = int(float(d)) if d else 0
+                    except:
+                        pass
+
+                # استخراج مقادیر عددی قیمت از رشته‌های مختلف
+                def _parse_price(val) -> float:
+                    if not val:
+                        return 0.0
+                    s = str(val).replace("$","").replace(",","").replace("USD","").strip()
+                    try:
+                        return float(s)
+                    except:
+                        return 0.0
+
+                base_price = _parse_price(
+                    price_info.get("base") or price_info.get("baseAmount") or
+                    price_info.get("basePrice") or price_info.get("original") or 0
+                )
+                final_price = _parse_price(
+                    price_info.get("final") or price_info.get("finalAmount") or
+                    price_info.get("finalPrice") or price_info.get("amount") or 0
+                )
+
+                # اگر هنوز discount نداریم، محاسبه دستی
+                if discount == 0 and base_price > 0 and 0 <= final_price < base_price:
+                    discount = int((1 - final_price / base_price) * 100)
 
                 if discount < MIN_DISCOUNT and discount != 100:
                     continue
 
-                # فرمت قیمت
-                try:
-                    orig_fmt = f"${float(base_price):.2f}" if base_price else ""
-                    final_fmt = f"${float(final_price):.2f}" if final_price else ""
-                    if discount == 100 or (final_price and float(final_price) == 0):
-                        final_fmt = "FREE"
-                except:
-                    orig_fmt = str(base_price)
-                    final_fmt = str(final_price)
+                orig_fmt = f"${base_price:.2f}" if base_price > 0 else ""
+                final_fmt = "FREE" if (discount == 100 or final_price == 0) else (f"${final_price:.2f}" if final_price > 0 else "")
 
-                # لینک
-                slug = item.get("slug", "") or item.get("id", "")
+                slug = item.get("slug", "") or str(item.get("id", ""))
                 link = f"https://www.gog.com/en/game/{slug}" if slug else ""
                 if not link:
                     continue
 
-                # تصویر
-                cover = (item.get("coverHorizontal", "") or
-                         item.get("cover", "") or
+                cover = (item.get("coverHorizontal", "") or item.get("cover", "") or
                          item.get("image", "") or "")
-                if cover and not cover.startswith("http"):
-                    cover = "https:" + cover if cover.startswith("//") else cover
+                if cover and cover.startswith("//"):
+                    cover = "https:" + cover
 
                 game_id = str(item.get("id", slug or title.lower().replace(" ", "-")))
-                is_ftk = discount == 100 and (not final_price or float(final_price) == 0)
+                is_ftk = discount == 100 and final_price == 0
 
                 game = make_game("gog", game_id, title, discount, link, orig_fmt, final_fmt,
                                image_url=cover, is_free_to_keep=is_ftk)
 
-                # تاریخ پایان تخفیف
-                promo_end = item.get("promoEndDate", "") or item.get("discountEndDate", "")
+                promo_end = item.get("promoEndDate", "") or item.get("discountEndDate", "") or item.get("saleEndsAt", "")
                 if promo_end:
                     game["deal_end"] = promo_end[:10]
+                promo_start = item.get("promoStartDate", "") or item.get("discountStartDate", "") or item.get("saleStartsAt", "")
+                if promo_start:
+                    game["deal_start"] = promo_start[:10]
 
                 games.append(game)
-                log.info(f"  🟣 GOG: {title} -{discount}%")
+                log.info(f"  🟣 GOG: {title} -{discount}% (base={base_price}, final={final_price})")
 
             except Exception as e:
                 log.debug(f"GOG item parse error: {e}")
@@ -1566,6 +1596,13 @@ def enrich_from_steam(game: dict) -> bool:
     return True
 
 # ─── Caption Builder ───────────────────────────────────────────────────
+def _make_title_hashtag(title: str) -> str:
+    """اسم بازی را به هشتگ تبدیل می‌کند"""
+    clean = re.sub(r'[™®©:\-–—\'"!?.,]', '', title)
+    clean = re.sub(r'\s+', '', clean)
+    clean = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF]', '', clean)
+    return f"#{clean}" if clean else ""
+
 def build_caption(game: dict, start_date: str, end_date: str) -> str:
     store = game["store"]
     meta = STORE_META[store]
@@ -1589,7 +1626,7 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
         if store == "steam":
             review_line = f"{mood} <b>{rev_pct}%</b> from {rev_count:,} reviews — {rev_desc}"
         else:
-            review_line = f"{mood} <b>{rev_pct}%</b> from {rev_count:,} RAWG ratings"
+            review_line = f"{mood} <b>{rev_pct}%</b> from {rev_count:,} ratings"
             if metacritic:
                 review_line += f"  |  Metacritic: <b>{metacritic}</b>"
     else:
@@ -1607,51 +1644,127 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
         price_block = f"<s>{orig}</s> → <b>{final}</b>" if orig and final else (final or orig or "?")
         disc_block = f"<b>-{discount}%</b> 🔥"
 
+    # ─── تاریخ Detected با شمسی ───────────────────────────────────────
+    now_dt = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    now_gregorian = now_dt.strftime("%d %b %Y")
+    now_detected_str = now_gregorian
+    if JDT_AVAILABLE and jdatetime:
+        try:
+            jd_now = jdatetime.datetime.fromgregorian(datetime=now_dt)
+            now_shamsi = jd_now.strftime("%Y/%m/%d")
+            now_detected_str = f"{now_gregorian} | {now_shamsi}"
+        except:
+            pass
+
+    # ─── هشتگ‌های غنی ─────────────────────────────────────────────────
     tags = ["#FreeGamesHub", meta["tag"]]
-    for g in genres[:2]:
+
+    # هشتگ اسم بازی (مهم‌ترین برای سرچ)
+    title_tag = _make_title_hashtag(title)
+    if title_tag:
+        tags.append(title_tag)
+
+    # هشتگ کلمات مهم عنوان (برای عناوین چند کلمه‌ای)
+    title_words = re.sub(r'[™®©:\-–—\'"!?.,]', ' ', title).split()
+    for word in title_words:
+        if len(word) >= 4 and word[0].isupper():
+            w_clean = re.sub(r'[^a-zA-Z0-9]', '', word)
+            if w_clean and f"#{w_clean}" not in tags:
+                tags.append(f"#{w_clean}")
+
+    # هشتگ ژانر
+    for g in genres[:3]:
         tag = re.sub(r'[^a-zA-Z0-9]', '', g)
-        if tag:
+        if tag and f"#{tag}" not in tags:
             tags.append(f"#{tag}")
+
+    # هشتگ وضعیت تخفیف
     if is_ftk:
         tags.append("#FreeToKeep")
-    elif discount == 100:
-        tags.append("#FreeGames")
-    if discount >= 75:
-        tags.append("#BigDeal")
+        tags.append("#رایگان")
+    if discount == 100 and not is_ftk:
+        tags.append("#FreeWeekend")
+        tags.append("#رایگان")
     if discount >= 90:
         tags.append("#MegaDeal")
+        tags.append("#تخفیف")
+    elif discount >= 75:
+        tags.append("#BigDeal")
+        tags.append("#تخفیف")
+
+    # هشتگ پلتفرم
+    if store in ("steam", "epic", "gog"):
+        tags.append("#PC")
+        tags.append("#بازی_رایانه")
+    elif store in ("playstation", "playstation_essential", "playstation_extra"):
+        tags.append("#PS4")
+        tags.append("#PS5")
+        tags.append("#PlayStation")
+    elif store == "xbox_gamepass":
+        tags.append("#Xbox")
+        tags.append("#GamePass")
+
     if game.get("is_aaa"):
         tags.append("#AAA")
-    hashtags = " ".join(tags)
 
-    now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    # حذف تکراری
+    seen_tags = []
+    for t in tags:
+        if t not in seen_tags:
+            seen_tags.append(t)
+    hashtags = " ".join(seen_tags)
+
+    # ─── ساخت متن پیام ───────────────────────────────────────────────
     lines = [f"{meta['emoji']} <b>[{meta['name']}]</b>  🎮 <b>{title}</b>", ""]
+
     if genre_str:
         lines += [f"🎯 <b>Genre:</b> {genre_str}", ""]
+
     if desc and desc != "No description available.":
         lines += ["📝 <b>About:</b>", desc, ""]
+
     if review_line:
         label = "Steam Reviews" if store == "steam" else "Rating"
         lines += [f"⭐ <b>{label}:</b> {review_line}", ""]
+
     lines += [f"💰 <b>Price:</b> {price_block}", f"💸 <b>Discount:</b> {disc_block}", ""]
-    if start_date or end_date:
-        lines += ["📅 <b>Offer Calendar:</b>", ""]
+
+    # ─── تاریخ‌ها: میلادی اول، شمسی دوم ─────────────────────────────
+    has_dates = start_date or end_date
+    if has_dates:
+        lines += ["📅 <b>Offer Period:</b>"]
         if start_date:
-            lines += [f"  🟢 <b>Start:</b> {format_date_persian_english(start_date)}", ""]
+            lines.append(f"  🟢 <b>Start:</b> {format_date_bilingual(start_date)}")
         if end_date:
-            lines += [f"  🔴 <b>End:</b> {format_date_persian_english(end_date)}", ""]
-    lines += [f"📅 <b>Detected:</b> {now_utc} UTC", "", f"🔗 {game['link']}", "", hashtags]
+            lines.append(f"  🔴 <b>End:</b>   {format_date_bilingual(end_date)}")
+        lines.append("")
+    else:
+        # بدون تاریخ مشخص
+        lines += ["📅 <b>Offer Period:</b> در حال حاضر فعال", ""]
+
+    lines += [
+        f"🕐 <b>Detected:</b> {now_detected_str} UTC",
+        "",
+        f"🔗 {game['link']}",
+        "",
+        hashtags,
+    ]
 
     caption = "\n".join(lines)
+
+    # کوتاه کردن در صورت نیاز (حداکثر ۱۰۲۴ کاراکتر Telegram)
     if len(caption) > 1024:
-        short = raw_desc[:80].rstrip() + "…"
+        short_desc = raw_desc[:80].rstrip() + "…"
         new_lines = []
         for line in lines:
             if line.startswith("📝 <b>About:</b>"):
-                new_lines.append(f"📝 <b>About:</b> {short}")
+                new_lines.append(f"📝 <b>About:</b> {short_desc}")
+            elif line == desc:
+                continue
             else:
                 new_lines.append(line)
         caption = "\n".join(new_lines)
+
     if len(caption) > 1024:
         new_lines, skip = [], False
         for line in lines:
@@ -1663,7 +1776,11 @@ def build_caption(game: dict, start_date: str, end_date: str) -> str:
                 continue
             if not skip:
                 new_lines.append(line)
-        caption = "\n".join(new_lines)[:1024]
+        caption = "\n".join(new_lines)
+
+    if len(caption) > 1024:
+        caption = caption[:1021] + "…"
+
     return caption
 
 # ─── Telegram Sender ──────────────────────────────────────────────────
@@ -1726,9 +1843,9 @@ def process_game(game: dict) -> tuple:
     elif store == "playstation":
         start_date, end_date, period_anchor = playstation_get_promo_info(game)
     elif store in ["playstation_essential", "playstation_extra"]:
-        period_anchor = f"MONTH:{datetime.datetime.utcnow().strftime('%Y-%m')}"
+        period_anchor = f"MONTH:{datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime('%Y-%m')}"
     elif store == "xbox_gamepass":
-        period_anchor = f"GAMEPASS:{datetime.datetime.utcnow().strftime('%Y-%m')}"
+        period_anchor = f"GAMEPASS:{datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime('%Y-%m')}"
     else:
         period_anchor = current_week_anchor()
 
