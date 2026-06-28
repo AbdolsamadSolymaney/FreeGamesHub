@@ -2,18 +2,28 @@ name: run-bot
 
 on:
   schedule:
-    - cron: '0 */12 * * *'   # هر ۱۲ ساعت
-  workflow_dispatch:           # اجرای دستی هم ممکن باشه
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:           # manual trigger
+
+# Required: write permission to commit games.db back to repo
+permissions:
+  contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # fetch full history so git push works cleanly
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -23,7 +33,9 @@ jobs:
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
-          RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_CHANNEL:   ${{ secrets.TELEGRAM_CHANNEL }}
+          RAWG_API_KEY:       ${{ secrets.RAWG_API_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_WORKSPACE:   ${{ github.workspace }}
         run: python main.py
