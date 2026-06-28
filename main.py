@@ -2453,4 +2453,94 @@ def main():
     log.info("── Fetching Xbox Game Pass ────────────────────────────")
     _merge(all_games, fetch_xbox_gamepass())
 
-    log.info(f"Total unique deals before filtering: {len(all_ga
+    log.info(f"Total unique deals before filtering: {len(all_games)}")
+
+    # filter permanent free-to-play (not FTK promos)
+    filtered = []
+    for g in all_games:
+        if g.get("is_free_to_play", False) and not g.get("is_free_to_keep", False):
+            continue
+        # only check steam FTP — costly API call, skip for other stores
+        if (g["store"] == "steam" and g["id"].isdigit()
+                and steam_is_free_to_play(g["id"])
+                and not g.get("is_free_to_keep", False)):
+            continue
+        filtered.append(g)
+    all_games = filtered
+    log.info(f"Total after filtering Free to Play: {len(all_games)}")
+
+    if not all_games:
+        log.warning("No games found — exiting")
+        git_commit_db()
+        return
+
+    for g in all_games:
+        calculate_priority_score(g)
+
+    pc_stores   = ["steam", "epic", "gog"]
+    ps_stores   = ["playstation", "playstation_essential", "playstation_extra"]
+    xbox_stores = ["xbox_gamepass"]
+
+    pc_games    = sorted([g for g in all_games if g["store"] in pc_stores],
+                         key=lambda x: x.get("priority_score", 0), reverse=True)
+    ps_games    = sorted([g for g in all_games if g["store"] in ps_stores],
+                         key=lambda x: x.get("priority_score", 0), reverse=True)
+    xbox_games_f = sorted([g for g in all_games if g["store"] in xbox_stores],
+                          key=lambda x: x.get("priority_score", 0), reverse=True)
+
+    log.info(f"  Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_f)}")
+
+    groups = [(name, list(games)) for name, games in
+              [("PC", pc_games), ("PS", ps_games), ("Xbox", xbox_games_f)] if games]
+
+    counters   = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
+    total      = sum(len(g) for _, g in groups)
+    item_num   = 0
+    ai_rejected = 0
+
+    while any(games for _, games in groups):
+        for group_name, games in groups:
+            if not games:
+                continue
+            game = games.pop(0)
+            item_num += 1
+            store  = game["store"].upper()
+            label  = "FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
+            priority = game.get("priority_score", 0)
+            log.info(f"[{item_num:3}/{total}] [{group_name:<4}][{store:<20}] {game['title'][:38]:<38} | {label} | Score:{priority}")
+
+            status, reason = process_game(game)
+            counters[status] = counters.get(status, 0) + 1
+            if status == "sent":
+                log.info("       Sent")
+            elif status == "skipped":
+                log.info(f"       Skipped — {reason}")
+            elif status == "invalid":
+                log.info(f"       Invalid — {reason}")
+                if "AI:" in reason:
+                    ai_rejected += 1
+            else:
+                log.error(f"       Failed — {reason}")
+            time.sleep(3)
+
+    log.info("=" * 65)
+    log.info(f"  Sent:     {counters['sent']}")
+    log.info(f"  Skipped:  {counters['skipped']}")
+    log.info(f"  Invalid:  {counters['invalid']} (AI rejected: {ai_rejected})")
+    log.info(f"  Failed:   {counters['failed']}")
+    log.info("=" * 65)
+
+    # ── Step 3: Persist DB back to repo so next run knows what was sent ───
+    git_commit_db()
+
+
+if __name__ == "__main__":
+    # GitHub Actions: runs once per scheduled trigger (cron in workflow file).
+    import sys as _sys
+    print(f"Starting FreeGamesHub bot — Python {_sys.version}", flush=True)
+    try:
+        main()
+    except Exception as e:
+        log.exception("Unexpected error during run:")
+        print(f"FATAL ERROR: {e}", file=_sys.stderr, flush=True)
+        raise SystemExit(1)
