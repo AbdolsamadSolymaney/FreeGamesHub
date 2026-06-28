@@ -59,7 +59,13 @@ AAA_METACRITIC_THRESHOLD = 75
 AAA_RATING_THRESHOLD = 80
 AAA_REVIEWS_THRESHOLD = 2000
 
-SCRAPER = cloudscraper.create_scraper()
+# Wrap in try/except — if cloudscraper fails to initialize it should not crash the whole script
+try:
+    SCRAPER = cloudscraper.create_scraper()
+except Exception as _e:
+    import logging as _log
+    _log.getLogger(__name__).warning(f"cloudscraper init failed ({_e}), falling back to requests")
+    SCRAPER = requests.Session()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -313,7 +319,7 @@ def send_expiry_alert(alert: dict):
         log.error(f"Expiry alert error: {e}")
 
 # ─── Auto-pin last FTK PC post ────────────────────────────────────────────
-def get_pinned_ftk(platform: str = "pc") -> dict | None:
+def get_pinned_ftk(platform: str = "pc") -> Optional[dict]:
     conn = sqlite3.connect(DB_FILE)
     row = conn.execute(
         "SELECT message_id, title FROM pinned_ftk WHERE platform=?", (platform,)
@@ -388,7 +394,7 @@ def update_deal_history(game: dict):
     conn.commit()
     conn.close()
 
-def get_prev_deal(store: str, game_id: str) -> dict | None:
+def get_prev_deal(store: str, game_id: str) -> Optional[dict]:
     """Return last recorded deal data for this game, or None if first time."""
     conn = sqlite3.connect(DB_FILE)
     row = conn.execute(
@@ -475,7 +481,6 @@ def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_head
 # Uses claude-sonnet-4-6 via Anthropic API for intelligent game validation,
 # description enrichment, and quality assessment.
 # Falls back to rule-based logic if API is unavailable.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 class AIDecisionEngine:
     def __init__(self):
@@ -486,7 +491,7 @@ class AIDecisionEngine:
         else:
             log.info("AI Decision Engine initialized (rule-based fallback — set ANTHROPIC_API_KEY to enable)")
 
-    def _call_claude(self, system: str, user: str, max_tokens: int = 400) -> str | None:
+    def _call_claude(self, system: str, user: str, max_tokens: int = 400) -> Optional[str]:
         """Call Anthropic Messages API, return text content or None."""
         if not self.enabled:
             return None
@@ -583,7 +588,7 @@ class AIDecisionEngine:
         elif discount >= 75: q += 10
         return True, f"Rule-based validation (score: {min(q,100)})", {}
 
-    def _ai_validate_and_enrich(self, game: dict) -> Tuple[bool, str, Dict] | None:
+    def _ai_validate_and_enrich(self, game: dict) -> Optional[Tuple[bool, str, Dict]]:
         """
         Ask Claude to validate and enrich the game data.
         Returns None if API fails (so caller falls back to rule-based).
@@ -728,7 +733,7 @@ def check_jdatetime():
 # ─── RAWG API ────────────────────────────────────────────────────────────
 _rawg_cache: dict = {}
 
-def rawg_search(title: str) -> dict | None:
+def rawg_search(title: str) -> Optional[dict]:
     if not RAWG_API_KEY:
         return None
     cache_key = title.lower().strip()
@@ -1055,7 +1060,7 @@ def _steam_fetch_free_to_keep() -> list:
     log.info(f"Steam Free to Keep: {len(games)}")
     return games
 
-def steam_get_details(appid: str) -> dict | None:
+def steam_get_details(appid: str) -> Optional[dict]:
     time.sleep(1.2)
     r = safe_get("https://store.steampowered.com/api/appdetails", params={"appids": appid, "cc": "us", "l": "english"})
     if not r:
@@ -1894,7 +1899,7 @@ def _xbox_curated_list() -> list:
     return games
 
 # ─── Steam Enrich ──────────────────────────────────────────────────────
-def steam_search_by_title(title: str) -> str | None:
+def steam_search_by_title(title: str) -> Optional[str]:
     r = safe_get("https://store.steampowered.com/search/", params={"term": title, "cc": "US", "l": "english"}, retries=2)
     if not r:
         return None
@@ -2455,9 +2460,4 @@ def main():
 
     log.info("=" * 65)
     log.info(f"  Sent:     {counters['sent']}")
-    log.info(f"  Skipped:  {counters['skipped']}")
-    log.info(f"  Invalid:  {counters['invalid']} (AI rejected: {ai_rejected})")
-    log.info(f"  Failed:   {counters['failed']}")
-    log.info("=" * 65)
-
-    # ── Step 3: Persist DB back to repo so next run kno
+    log.info
