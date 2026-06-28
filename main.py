@@ -11,6 +11,7 @@ v4 fixes:
 """
 
 import os
+import sys
 import time
 import logging
 import hashlib
@@ -22,10 +23,23 @@ import json
 import subprocess
 from typing import List, Dict, Any, Optional, Tuple
 from bs4 import BeautifulSoup
-import cloudscraper
-import feedparser
 
-# ─── jdatetime ──────────────────────────────────────────────────────────
+# cloudscraper is optional — falls back to requests if unavailable
+try:
+    import cloudscraper as _cloudscraper_module
+    _CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    _CLOUDSCRAPER_AVAILABLE = False
+
+# feedparser is optional
+try:
+    import feedparser as _feedparser
+    _FEEDPARSER_AVAILABLE = True
+except ImportError:
+    _FEEDPARSER_AVAILABLE = False
+    _feedparser = None
+
+# jdatetime is optional
 try:
     import jdatetime
     JDT_AVAILABLE = True
@@ -59,13 +73,16 @@ AAA_METACRITIC_THRESHOLD = 75
 AAA_RATING_THRESHOLD = 80
 AAA_REVIEWS_THRESHOLD = 2000
 
-# Wrap in try/except — if cloudscraper fails to initialize it should not crash the whole script
+# ─── SCRAPER (cloudscraper with requests fallback) ─────────────────────
 try:
-    SCRAPER = cloudscraper.create_scraper()
+    if _CLOUDSCRAPER_AVAILABLE:
+        SCRAPER = _cloudscraper_module.create_scraper()
+    else:
+        SCRAPER = requests.Session()
+        log.warning("cloudscraper not available — using plain requests (some sites may block)")
 except Exception as _e:
-    import logging as _log
-    _log.getLogger(__name__).warning(f"cloudscraper init failed ({_e}), falling back to requests")
     SCRAPER = requests.Session()
+    log.warning(f"cloudscraper init failed ({_e}) — using plain requests")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -1568,8 +1585,10 @@ def _ps_fetch_rss_deals() -> list:
     PlayStation Blog RSS — the only reliable non-JS source for PS deals.
     """
     games = []
+    if not _FEEDPARSER_AVAILABLE or _feedparser is None:
+        return games
     try:
-        feed = feedparser.parse("https://blog.playstation.com/feed/")
+        feed = _feedparser.parse("https://blog.playstation.com/feed/")
         for entry in feed.entries[:20]:
             entry_title = entry.get("title", "")
             if not any(kw in entry_title for kw in ["Deal", "Sale", "Free", "Plus", "Discount"]):
@@ -2446,18 +2465,4 @@ def main():
 
             status, reason = process_game(game)
             counters[status] = counters.get(status, 0) + 1
-            if status == "sent":
-                log.info("       Sent")
-            elif status == "skipped":
-                log.info(f"       Skipped — {reason}")
-            elif status == "invalid":
-                log.info(f"       Invalid — {reason}")
-                if "AI:" in reason:
-                    ai_rejected += 1
-            else:
-                log.error(f"       Failed — {reason}")
-            time.sleep(3)
-
-    log.info("=" * 65)
-    log.info(f"  Sent:     {counters['sent']}")
-    log.info
+          
