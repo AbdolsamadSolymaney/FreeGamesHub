@@ -1,11 +1,13 @@
 """
 FreeGamesHub — Steam + Epic Games Store + GOG + PlayStation + Xbox Game Pass
 ================================================================================
-v3 fixes:
-- No Persian text in logs or messages (Shamsi dates kept)
-- Duplicate post prevention: stable deal_hash for stores without dates
-- Telegram image error fix: validate image URL before sending
-- PS API dead endpoints removed, clean static fallback used
+v4 fixes:
+- DB persisted in repo via git commit after each run (solves duplicates across Actions runs)
+- Xbox image: RAWG fallback + multiple CDN candidates
+- Steam: all games ≥75% discount are sent, no silent drops
+- Expiry alert: 2h before deal ends, send reminder message
+- Auto-pin last PC Free-to-Keep post
+- Telegram pin on new FTK PC game
 """
 
 import os
@@ -17,6 +19,7 @@ import sqlite3
 import datetime
 import re
 import json
+import subprocess
 from typing import List, Dict, Any, Optional, Tuple
 from bs4 import BeautifulSoup
 import cloudscraper
@@ -44,7 +47,12 @@ CHANNEL           = os.environ.get("TELEGRAM_CHANNEL")
 RAWG_API_KEY      = os.environ.get("RAWG_API_KEY", "")
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-DB_FILE      = "games.db"
+
+# DB lives in the repo directory so git can commit & push it between runs.
+# GitHub Actions checks out to GITHUB_WORKSPACE; locally it falls back to cwd.
+REPO_DIR = os.environ.get("GITHUB_WORKSPACE", os.path.dirname(os.path.abspath(__file__)))
+DB_FILE  = os.path.join(REPO_DIR, "games.db")
+
 MIN_DISCOUNT = 75
 
 AAA_METACRITIC_THRESHOLD = 75
@@ -102,6 +110,7 @@ def init_db():
             deal_hash  TEXT,
             title      TEXT,
             sent_at    TEXT,
+            message_id INTEGER DEFAULT 0,
             PRIMARY KEY (store, game_id, deal_hash)
         )
     """)
@@ -127,8 +136,77 @@ def init_db():
             PRIMARY KEY (game_id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS expiry_alerts (
+            store      TEXT,
+            game_id    TEXT,
+            deal_hash  TEXT,
+            deal_end   TEXT,
+            alerted    INTEGER DEFAULT 0,
+            PRIMARY KEY (store, game_id, deal_hash)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pinned_ftk (
+            platform   TEXT PRIMARY KEY,
+            message_id INTEGER,
+            title      TEXT,
+            pinned_at  TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+# ─── Git DB Persistence ───────────────────────────────────────────────────
+def git_commit_db():
+    """
+    Commit and push games.db back to the repo after each run.
+    This is the ONLY way to preserve sent-state between GitHub Actions runs,
+    since each run starts with a fresh checkout.
+    Requires GITHUB_TOKEN with write permission (automatically available in Actions).
+    """
+    try:
+        repo = REPO_DIR
+        git = ["git", "-C", repo]
+
+        # configure git identity for the commit
+        subprocess.run([*git, "config", "user.name", "FreeGamesBot"], check=True, capture_output=True)
+        subprocess.run([*git, "config", "user.email", "bot@freegameshub.local"], check=True, capture_output=True)
+
+        # stage only the DB file
+        rel = os.path.relpath(DB_FILE, repo)
+        subprocess.run([*git, "add", rel], check=True, capture_output=True)
+
+        # check if there's anything to commit
+        result = subprocess.run([*git, "diff", "--cached", "--quiet"], capture_output=True)
+        if result.returncode == 0:
+            log.info("DB unchanged — nothing to commit")
+            return
+
+        ts = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M UTC")
+        subprocess.run([*git, "commit", "-m", f"chore: update games.db [{ts}]"],
+                       check=True, capture_output=True)
+
+        # push using GITHUB_TOKEN via https remote
+        token = GITHUB_TOKEN
+        if token:
+            # get remote URL and inject token
+            r = subprocess.run([*git, "remote", "get-url", "origin"],
+                               capture_output=True, text=True)
+            remote_url = r.stdout.strip()
+            if "github.com" in remote_url and "https://" in remote_url:
+                authed = remote_url.replace("https://", f"https://x-access-token:{token}@")
+                subprocess.run([*git, "push", authed, "HEAD"], check=True, capture_output=True)
+            else:
+                subprocess.run([*git, "push"], check=True, capture_output=True)
+        else:
+            subprocess.run([*git, "push"], check=True, capture_output=True)
+
+        log.info("DB committed and pushed to repo")
+    except subprocess.CalledProcessError as e:
+        log.warning(f"Git push failed: {e.stderr.decode()[:200] if e.stderr else e}")
+    except Exception as e:
+        log.warning(f"Git DB persistence error: {e}")
 
 def is_sent(store: str, game_id: str, deal_hash: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
@@ -139,15 +217,160 @@ def is_sent(store: str, game_id: str, deal_hash: str) -> bool:
     conn.close()
     return row is not None
 
-def mark_sent(store: str, game_id: str, title: str, deal_hash: str):
+def mark_sent(store: str, game_id: str, title: str, deal_hash: str, message_id: int = 0):
     ts = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(DB_FILE)
     conn.execute(
-        "INSERT OR IGNORE INTO sent (store, game_id, deal_hash, title, sent_at) VALUES (?,?,?,?,?)",
-        (store, game_id, deal_hash, title, ts)
+        "INSERT OR IGNORE INTO sent (store, game_id, deal_hash, title, sent_at, message_id) VALUES (?,?,?,?,?,?)",
+        (store, game_id, deal_hash, title, ts, message_id)
     )
     conn.commit()
     conn.close()
+
+def register_expiry_alert(store: str, game_id: str, deal_hash: str, deal_end: str):
+    """Register a deal for expiry alert if it has an end date."""
+    if not deal_end:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        INSERT OR IGNORE INTO expiry_alerts (store, game_id, deal_hash, deal_end, alerted)
+        VALUES (?, ?, ?, ?, 0)
+    """, (store, game_id, deal_hash, deal_end))
+    conn.commit()
+    conn.close()
+
+def get_pending_expiry_alerts() -> list:
+    """Return deals expiring in the next 2 hours that haven't been alerted yet."""
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    cutoff = now + datetime.timedelta(hours=2)
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute("""
+        SELECT ea.store, ea.game_id, ea.deal_hash, ea.deal_end, s.title, s.message_id
+        FROM expiry_alerts ea
+        JOIN sent s ON s.store=ea.store AND s.game_id=ea.game_id AND s.deal_hash=ea.deal_hash
+        WHERE ea.alerted=0 AND ea.deal_end != ''
+    """).fetchall()
+    conn.close()
+    alerts = []
+    for store, game_id, deal_hash, deal_end, title, message_id in rows:
+        try:
+            end_dt = datetime.datetime.strptime(deal_end[:10], "%Y-%m-%d")
+            if now <= end_dt <= cutoff:
+                alerts.append({
+                    "store": store, "game_id": game_id, "deal_hash": deal_hash,
+                    "deal_end": deal_end, "title": title, "message_id": message_id
+                })
+        except:
+            pass
+    return alerts
+
+def mark_expiry_alerted(store: str, game_id: str, deal_hash: str):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(
+        "UPDATE expiry_alerts SET alerted=1 WHERE store=? AND game_id=? AND deal_hash=?",
+        (store, game_id, deal_hash)
+    )
+    conn.commit()
+    conn.close()
+
+def send_expiry_alert(alert: dict):
+    """Send a 2-hour expiry reminder for a deal."""
+    title = alert["title"]
+    deal_end = alert["deal_end"]
+    end_display = format_date_bilingual(deal_end)
+    store_name = alert["store"].replace("_", " ").title()
+
+    lines = [
+        f"⏰ <b>Deal Ending Soon!</b>",
+        f"",
+        f"🎮 <b>{title}</b>",
+        f"🏪 {store_name}",
+        f"",
+        f"🔴 <b>Expires:</b> {end_display}",
+        f"⚡ Less than 2 hours left — grab it now!",
+    ]
+    # reply to original message if we have its ID
+    msg_id = alert.get("message_id", 0)
+    payload = {
+        "chat_id": CHANNEL,
+        "text": "\n".join(lines),
+        "parse_mode": "HTML",
+    }
+    if msg_id:
+        payload["reply_to_message_id"] = msg_id
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data=payload, timeout=20
+        )
+        if r.json().get("ok"):
+            mark_expiry_alerted(alert["store"], alert["game_id"], alert["deal_hash"])
+            log.info(f"Expiry alert sent: {title}")
+        else:
+            log.warning(f"Expiry alert failed: {r.json().get('description')}")
+    except Exception as e:
+        log.error(f"Expiry alert error: {e}")
+
+# ─── Auto-pin last FTK PC post ────────────────────────────────────────────
+def get_pinned_ftk(platform: str = "pc") -> dict | None:
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute(
+        "SELECT message_id, title FROM pinned_ftk WHERE platform=?", (platform,)
+    ).fetchone()
+    conn.close()
+    return {"message_id": row[0], "title": row[1]} if row else None
+
+def set_pinned_ftk(platform: str, message_id: int, title: str):
+    ts = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        INSERT OR REPLACE INTO pinned_ftk (platform, message_id, title, pinned_at)
+        VALUES (?, ?, ?, ?)
+    """, (platform, message_id, title, ts))
+    conn.commit()
+    conn.close()
+
+def tg_pin_message(message_id: int) -> bool:
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage",
+            data={"chat_id": CHANNEL, "message_id": message_id, "disable_notification": True},
+            timeout=20
+        )
+        return r.json().get("ok", False)
+    except:
+        return False
+
+def tg_unpin_message(message_id: int) -> bool:
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/unpinChatMessage",
+            data={"chat_id": CHANNEL, "message_id": message_id},
+            timeout=20
+        )
+        return r.json().get("ok", False)
+    except:
+        return False
+
+def handle_ftk_pin(game: dict, message_id: int):
+    """If this is a PC FTK post, unpin old and pin new."""
+    store = game.get("store", "")
+    if not game.get("is_free_to_keep"):
+        return
+    if store not in ("steam", "epic", "gog"):
+        return
+    if message_id <= 0:
+        return
+
+    prev = get_pinned_ftk("pc")
+    if prev and prev["message_id"]:
+        tg_unpin_message(prev["message_id"])
+        log.info(f"Unpinned old FTK: {prev['title']}")
+
+    if tg_pin_message(message_id):
+        set_pinned_ftk("pc", message_id, game["title"])
+        log.info(f"Pinned new FTK: {game['title']} (msg_id={message_id})")
 
 def update_deal_history(game: dict):
     """Record the latest deal data — used to detect changes on future runs."""
@@ -622,19 +845,43 @@ def _merge(base: list, new_items: list):
 # ─── Image URL ──────────────────────────────────────────────────────────
 def get_image_candidates(game: dict) -> list:
     candidates = []
+    store = game.get("store", "")
+
+    # Steam games: multiple CDN options
     if game.get("steam_image"):
         candidates.append(game["steam_image"])
-    if game.get("store") == "steam":
-        candidates.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{game['id']}/capsule_616x353.jpg")
-        candidates.append(f"https://cdn.akamai.steamstatic.com/steam/apps/{game['id']}/header.jpg")
-    if game.get("rawg_image"):
+    if store == "steam" and game["id"].isdigit():
+        sid = game["id"]
+        candidates.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{sid}/capsule_616x353.jpg")
+        candidates.append(f"https://cdn.akamai.steamstatic.com/steam/apps/{sid}/header.jpg")
+        candidates.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{sid}/library_600x900.jpg")
+
+    # Xbox: try to find a Steam CDN image by searching steam_image set during enrich
+    if store == "xbox_gamepass":
+        if game.get("steam_image"):
+            candidates.append(game["steam_image"])
+        # also try rawg
+        if game.get("rawg_image"):
+            candidates.append(game["rawg_image"])
+        # image_url from Xbox catalog API
+        if game.get("image_url"):
+            candidates.append(game["image_url"])
+
+    # RAWG image (works for GOG, Epic, PS, Xbox)
+    if game.get("rawg_image") and game.get("rawg_image") not in candidates:
         candidates.append(game["rawg_image"])
+
+    # store-provided image_url
     if game.get("image_url"):
         img = game["image_url"]
-        img = img.replace("_small", "_large").replace("_thumb", "_original")
-        img = re.sub(r'/\d+x\d+/', '/original/', img)
-        candidates.append(img)
-        candidates.append(game["image_url"])
+        for variant in [
+            img.replace("_small", "_large").replace("_thumb", "_original"),
+            re.sub(r'/\d+x\d+/', '/original/', img),
+            img,
+        ]:
+            if variant not in candidates:
+                candidates.append(variant)
+
     valid_ext = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
     return [c for c in candidates if c and any(c.lower().split('?')[0].endswith(ext) for ext in valid_ext)]
 
@@ -1890,8 +2137,13 @@ def _is_valid_image_url(url: str) -> bool:
     except:
         return False
 
-def send_game(game: dict, caption: str) -> bool:
-    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+def send_game(game: dict, caption: str) -> int:
+    """
+    Send game to Telegram channel.
+    Returns message_id (>0) on success, 0 on failure.
+    """
+    tg_photo = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    tg_text  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     candidates = get_image_candidates(game)
     candidates = [c for c in candidates if c]
 
@@ -1901,39 +2153,40 @@ def send_game(game: dict, caption: str) -> bool:
         if _is_valid_image_url(img):
             valid_images.append(img)
         else:
-            log.debug(f"Image URL invalid/unreachable: {img[:80]}")
+            log.debug(f"Image invalid: {img[:80]}")
 
     for img in valid_images:
         try:
-            r = requests.post(tg_url, data={
+            r = requests.post(tg_photo, data={
                 "chat_id": CHANNEL, "photo": img,
                 "caption": caption, "parse_mode": "HTML"
             }, timeout=30)
-            if r.json().get("ok"):
-                return True
-            err = r.json().get("description", "")
+            data = r.json()
+            if data.get("ok"):
+                return data["result"]["message_id"]
+            err = data.get("description", "")
             if "can't parse" in err.lower():
                 clean = BeautifulSoup(caption, "html.parser").get_text()
-                r2 = requests.post(tg_url, data={
+                r2 = requests.post(tg_photo, data={
                     "chat_id": CHANNEL, "photo": img, "caption": clean[:1024]
                 }, timeout=30)
-                if r2.json().get("ok"):
-                    return True
+                d2 = r2.json()
+                if d2.get("ok"):
+                    return d2["result"]["message_id"]
         except Exception as e:
             log.error(f"Send exception: {e}")
 
-    # fallback: send as text only (no photo)
+    # fallback: text only (no photo)
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHANNEL, "text": caption, "parse_mode": "HTML"},
-            timeout=30
-        )
-        if r.json().get("ok"):
-            return True
+        r = requests.post(tg_text, data={
+            "chat_id": CHANNEL, "text": caption, "parse_mode": "HTML"
+        }, timeout=30)
+        data = r.json()
+        if data.get("ok"):
+            return data["result"]["message_id"]
     except Exception as e:
         log.error(f"sendMessage fallback failed: {e}")
-    return False
+    return 0
 
 # ─── Process One Game ─────────────────────────────────────────────────
 AI_ENGINE = None
@@ -2055,16 +2308,21 @@ def process_game(game: dict) -> tuple:
     if not deal_hash:
         deal_hash = make_promo_key(store, gid, period_anchor)
 
-    # check if already sent with this exact hash
+    # check if already sent with this exact hash (DB-backed — persisted between runs)
     if is_sent(store, gid, deal_hash):
         return "skipped", "already sent this deal"
 
     caption = build_caption(game, start_date, end_date)
-    ok = send_game(game, caption)
-    if ok:
-        mark_sent(store, gid, title, deal_hash)
-        update_deal_history(game)   # record deal snapshot for change detection
+    message_id = send_game(game, caption)
+    if message_id > 0:
+        mark_sent(store, gid, title, deal_hash, message_id)
+        update_deal_history(game)
         mark_sent_cached(store, gid)
+        # register expiry alert if deal has an end date
+        if end_date:
+            register_expiry_alert(store, gid, deal_hash, end_date)
+        # auto-pin PC FTK posts
+        handle_ftk_pin(game, message_id)
         return "sent", ""
     else:
         return "failed", "telegram send error"
@@ -2085,12 +2343,23 @@ def main():
     if not RAWG_API_KEY:
         log.warning("RAWG_API_KEY not set — genre/description may be limited")
     if not ANTHROPIC_API_KEY:
-        log.warning("ANTHROPIC_API_KEY not set — AI validation disabled, using rules only")
+        log.warning("ANTHROPIC_API_KEY not set — using rule-based validation only")
 
     check_jdatetime()
     AI_ENGINE = AIDecisionEngine()
     init_db()
 
+    # ── Step 1: Send expiry alerts for deals ending in next 2 hours ───────
+    log.info("── Checking expiry alerts ──────────────────────────────")
+    alerts = get_pending_expiry_alerts()
+    if alerts:
+        log.info(f"  {len(alerts)} deal(s) expiring soon — sending alerts")
+        for alert in alerts:
+            send_expiry_alert(alert)
+    else:
+        log.info("  No expiry alerts pending")
+
+    # ── Step 2: Fetch all deals ───────────────────────────────────────────
     all_games = []
 
     log.info("── Fetching Steam ──────────────────────────────────────")
@@ -2116,11 +2385,15 @@ def main():
 
     log.info(f"Total unique deals before filtering: {len(all_games)}")
 
+    # filter permanent free-to-play (not FTK promos)
     filtered = []
     for g in all_games:
         if g.get("is_free_to_play", False) and not g.get("is_free_to_keep", False):
             continue
-        if g["store"] == "steam" and g["id"].isdigit() and steam_is_free_to_play(g["id"]) and not g.get("is_free_to_keep", False):
+        # only check steam FTP — costly API call, skip for other stores
+        if (g["store"] == "steam" and g["id"].isdigit()
+                and steam_is_free_to_play(g["id"])
+                and not g.get("is_free_to_keep", False)):
             continue
         filtered.append(g)
     all_games = filtered
@@ -2128,19 +2401,20 @@ def main():
 
     if not all_games:
         log.warning("No games found — exiting")
+        git_commit_db()
         return
 
     for g in all_games:
         calculate_priority_score(g)
 
-    pc_stores = ["steam", "epic", "gog"]
-    ps_stores = ["playstation", "playstation_essential", "playstation_extra"]
+    pc_stores   = ["steam", "epic", "gog"]
+    ps_stores   = ["playstation", "playstation_essential", "playstation_extra"]
     xbox_stores = ["xbox_gamepass"]
 
-    pc_games = sorted([g for g in all_games if g["store"] in pc_stores],
-                      key=lambda x: x.get("priority_score", 0), reverse=True)
-    ps_games = sorted([g for g in all_games if g["store"] in ps_stores],
-                      key=lambda x: x.get("priority_score", 0), reverse=True)
+    pc_games    = sorted([g for g in all_games if g["store"] in pc_stores],
+                         key=lambda x: x.get("priority_score", 0), reverse=True)
+    ps_games    = sorted([g for g in all_games if g["store"] in ps_stores],
+                         key=lambda x: x.get("priority_score", 0), reverse=True)
     xbox_games_f = sorted([g for g in all_games if g["store"] in xbox_stores],
                           key=lambda x: x.get("priority_score", 0), reverse=True)
 
@@ -2149,9 +2423,9 @@ def main():
     groups = [(name, list(games)) for name, games in
               [("PC", pc_games), ("PS", ps_games), ("Xbox", xbox_games_f)] if games]
 
-    counters = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
-    total = sum(len(g) for _, g in groups)
-    sent = 0
+    counters   = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
+    total      = sum(len(g) for _, g in groups)
+    item_num   = 0
     ai_rejected = 0
 
     while any(games for _, games in groups):
@@ -2159,38 +2433,31 @@ def main():
             if not games:
                 continue
             game = games.pop(0)
-            sent += 1
-            store = game["store"].upper()
-            label = "🎁 FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
+            item_num += 1
+            store  = game["store"].upper()
+            label  = "FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
             priority = game.get("priority_score", 0)
-            log.info(f"[{sent:3}/{total}] [{group_name:<4}][{store:<5}] {game['title'][:40]:<40} | {label} | Score:{priority}")
+            log.info(f"[{item_num:3}/{total}] [{group_name:<4}][{store:<20}] {game['title'][:38]:<38} | {label} | Score:{priority}")
 
             status, reason = process_game(game)
             counters[status] = counters.get(status, 0) + 1
             if status == "sent":
-                log.info("       ✅ Sent")
+                log.info("       Sent")
             elif status == "skipped":
-                log.info(f"       ⏭  Skipped — {reason}")
+                log.info(f"       Skipped — {reason}")
             elif status == "invalid":
-                log.info(f"       ⚠️  Invalid — {reason}")
+                log.info(f"       Invalid — {reason}")
                 if "AI:" in reason:
                     ai_rejected += 1
             else:
-                log.error(f"       ❌ Failed — {reason}")
+                log.error(f"       Failed — {reason}")
             time.sleep(3)
 
-    log.info("═" * 65)
-    log.info(f"  ✅ Sent:     {counters['sent']}")
-    log.info(f"  ⏭  Skipped: {counters['skipped']}")
-    log.info(f"  ⚠️  Invalid: {counters['invalid']} (AI rejected: {ai_rejected})")
-    log.info(f"  ❌ Failed:   {counters['failed']}")
-    log.info("═" * 65)
+    log.info("=" * 65)
+    log.info(f"  Sent:     {counters['sent']}")
+    log.info(f"  Skipped:  {counters['skipped']}")
+    log.info(f"  Invalid:  {counters['invalid']} (AI rejected: {ai_rejected})")
+    log.info(f"  Failed:   {counters['failed']}")
+    log.info("=" * 65)
 
-if __name__ == "__main__":
-    # GitHub Actions: runs once per scheduled trigger (cron).
-    # The while/sleep loop has been removed — scheduling is handled by the workflow file.
-    try:
-        main()
-    except Exception as e:
-        log.exception("Unexpected error during run:")
-        raise SystemExit(1)
+    # ── Step 3: Persist DB back to repo so next run kno
