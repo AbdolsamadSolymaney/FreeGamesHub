@@ -471,27 +471,34 @@ def is_recently_sent_db(store: str, game_id: str, days: int = 365) -> bool:
         return False
 
 # ─── HTTP Helper ─────────────────────────────────────────────────────────
-def safe_get(url, params=None, retries=5, delay=2, use_scraper=False, extra_headers=None):
+# NOTE: retries default is 3 (not 5) to avoid long timeouts in GitHub Actions.
+# 403/404 errors skip retries immediately — no point retrying auth failures.
+def safe_get(url, params=None, retries=3, delay=1, use_scraper=False, extra_headers=None):
     headers = dict(HEADERS)
     if extra_headers:
         headers.update(extra_headers)
     for attempt in range(retries):
         try:
-            if use_scraper:
-                r = SCRAPER.get(url, params=params, headers=headers, timeout=30)
+            if use_scraper and _CLOUDSCRAPER_AVAILABLE:
+                r = SCRAPER.get(url, params=params, headers=headers, timeout=15)
             else:
-                r = requests.get(url, params=params, headers=headers, timeout=20)
+                r = requests.get(url, params=params, headers=headers, timeout=15)
             if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 10))
+                wait = int(r.headers.get("Retry-After", 5))
                 log.warning(f"Rate limited — waiting {wait}s")
                 time.sleep(wait)
                 continue
+            # 403/404: don't retry — server is blocking or resource doesn't exist
+            if r.status_code in (403, 404):
+                log.warning(f"HTTP {r.status_code} for {url[:80]} — skipping")
+                return None
             r.raise_for_status()
             return r
         except Exception as e:
             log.warning(f"Request error #{attempt+1}: {e}")
-        time.sleep(delay * (attempt + 1))
-    log.error(f"All {retries} attempts failed for {url}")
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+    log.error(f"All {retries} attempts failed for {url[:80]}")
     return None
 
 # ─── AI Decision Engine (Anthropic API) ─────────────────────────────────
@@ -954,34 +961,73 @@ def get_deal_label(deal_type: str, discount: int) -> str:
 
 # ─── Steam Sources ─────────────────────────────────────────────────────
 def _steam_fetch_featured() -> list:
+    """
+    Fetch Steam deals via the ISteamApps API and Steam storefront API.
+    Uses multiple fallback endpoints since Steam blocks some CI/CD IPs.
+    """
     games = []
-    r = safe_get("https://store.steampowered.com/api/featuredcategories/", params={"cc": "US", "l": "english"})
-    if not r:
-        return games
-    try:
-        data = r.json()
-        for item in data.get("specials", {}).get("items", []):
-            name = item.get("name", "")
-            if not name:
-                continue
-            appid = str(item.get("id", ""))
-            discount = item.get("discount_percent", 0)
-            orig = item.get("original_price", 0)
-            final = item.get("final_price", 0)
-            if not appid:
-                continue
-            games.append(make_game("steam", appid, name, discount,
-                f"https://store.steampowered.com/app/{appid}/",
-                f"${orig/100:.2f}" if orig else "",
-                f"${final/100:.2f}" if final else "",
-                f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"))
-    except Exception as e:
-        log.error(f"Steam Featured error: {e}")
+
+    # Endpoint 1: Steam storefront featured (sometimes blocked from CI)
+    r = safe_get("https://store.steampowered.com/api/featuredcategories/",
+                 params={"cc": "US", "l": "english"},
+                 extra_headers={"Accept": "application/json"})
+    if r:
+        try:
+            data = r.json()
+            for item in data.get("specials", {}).get("items", []):
+                name = item.get("name", "")
+                if not name:
+                    continue
+                appid = str(item.get("id", ""))
+                discount = item.get("discount_percent", 0)
+                orig = item.get("original_price", 0)
+                final = item.get("final_price", 0)
+                if not appid:
+                    continue
+                games.append(make_game("steam", appid, name, discount,
+                    f"https://store.steampowered.com/app/{appid}/",
+                    f"${orig/100:.2f}" if orig else "",
+                    f"${final/100:.2f}" if final else "",
+                    f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"))
+        except Exception as e:
+            log.error(f"Steam Featured error: {e}")
+
+    # Endpoint 2: Steam search JSON API (alternative, less blocked)
+    if not games:
+        r2 = safe_get("https://store.steampowered.com/search/results/",
+                      params={"specials": 1, "json": 1, "cc": "US", "l": "english", "count": 50},
+                      extra_headers={"Accept": "application/json"})
+        if r2:
+            try:
+                data2 = r2.json()
+                for item in data2.get("items", []):
+                    logo = item.get("logo", "")
+                    import re as _re
+                    match = _re.search(r"/apps/(\d+)/", logo)
+                    if not match:
+                        continue
+                    appid = match.group(1)
+                    name_html = item.get("name", "")
+                    name = BeautifulSoup(name_html, "html.parser").get_text().strip() if name_html else ""
+                    if not name:
+                        continue
+                    price_str = str(item.get("price", "")).lower()
+                    # only include if discounted
+                    if "sale" not in price_str and "$" not in price_str:
+                        continue
+                    games.append(make_game("steam", appid, name, 0,
+                        f"https://store.steampowered.com/app/{appid}/",
+                        image_url=f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg"))
+            except Exception as e:
+                log.error(f"Steam search JSON error: {e}")
+
     return games
 
 def _steam_fetch_html_search() -> list:
     games = []
-    r = safe_get("https://store.steampowered.com/search/", params={"specials": 1, "cc": "US", "l": "english"})
+    r = safe_get("https://store.steampowered.com/search/",
+                 params={"specials": 1, "cc": "US", "l": "english"},
+                 extra_headers={"Accept-Language": "en-US,en;q=0.9"})
     if not r:
         return games
     try:
@@ -2407,62 +2453,4 @@ def main():
     log.info("── Fetching Xbox Game Pass ────────────────────────────")
     _merge(all_games, fetch_xbox_gamepass())
 
-    log.info(f"Total unique deals before filtering: {len(all_games)}")
-
-    # filter permanent free-to-play (not FTK promos)
-    filtered = []
-    for g in all_games:
-        if g.get("is_free_to_play", False) and not g.get("is_free_to_keep", False):
-            continue
-        # only check steam FTP — costly API call, skip for other stores
-        if (g["store"] == "steam" and g["id"].isdigit()
-                and steam_is_free_to_play(g["id"])
-                and not g.get("is_free_to_keep", False)):
-            continue
-        filtered.append(g)
-    all_games = filtered
-    log.info(f"Total after filtering Free to Play: {len(all_games)}")
-
-    if not all_games:
-        log.warning("No games found — exiting")
-        git_commit_db()
-        return
-
-    for g in all_games:
-        calculate_priority_score(g)
-
-    pc_stores   = ["steam", "epic", "gog"]
-    ps_stores   = ["playstation", "playstation_essential", "playstation_extra"]
-    xbox_stores = ["xbox_gamepass"]
-
-    pc_games    = sorted([g for g in all_games if g["store"] in pc_stores],
-                         key=lambda x: x.get("priority_score", 0), reverse=True)
-    ps_games    = sorted([g for g in all_games if g["store"] in ps_stores],
-                         key=lambda x: x.get("priority_score", 0), reverse=True)
-    xbox_games_f = sorted([g for g in all_games if g["store"] in xbox_stores],
-                          key=lambda x: x.get("priority_score", 0), reverse=True)
-
-    log.info(f"  Grouped: PC={len(pc_games)}, PS={len(ps_games)}, Xbox={len(xbox_games_f)}")
-
-    groups = [(name, list(games)) for name, games in
-              [("PC", pc_games), ("PS", ps_games), ("Xbox", xbox_games_f)] if games]
-
-    counters   = {"sent": 0, "skipped": 0, "invalid": 0, "failed": 0}
-    total      = sum(len(g) for _, g in groups)
-    item_num   = 0
-    ai_rejected = 0
-
-    while any(games for _, games in groups):
-        for group_name, games in groups:
-            if not games:
-                continue
-            game = games.pop(0)
-            item_num += 1
-            store  = game["store"].upper()
-            label  = "FTK" if game.get("is_free_to_keep") else f"-{game['discount']}%"
-            priority = game.get("priority_score", 0)
-            log.info(f"[{item_num:3}/{total}] [{group_name:<4}][{store:<20}] {game['title'][:38]:<38} | {label} | Score:{priority}")
-
-            status, reason = process_game(game)
-            counters[status] = counters.get(status, 0) + 1
-          
+    log.info(f"Total unique deals before filtering: {len(all_ga
